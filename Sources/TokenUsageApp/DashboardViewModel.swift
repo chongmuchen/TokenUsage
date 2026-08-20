@@ -6,7 +6,6 @@ import TokenUsageCore
 private struct LoadedUsageCandidate: Sendable {
     let home: CodexHome
     let report: UsageReport
-    let importedTitle: String?
 }
 
 @MainActor
@@ -30,7 +29,6 @@ final class DashboardViewModel: ObservableObject {
     @Published var selectedTrendSpeeds: Set<UsageTrendSpeed> = []
 
     private let repository = ReportRepository()
-    private let coworkImportRepository: CoWorkUsageImportRepository
     private let titleStore = ThreadTitleStore()
     private let historyGenerator = HistoricalReportGenerator()
     private let bookmarkStore: SecurityScopedBookmarkStore
@@ -54,7 +52,6 @@ final class DashboardViewModel: ObservableObject {
         self.bookmarkStore = bookmarkStore
         self.builder = UsageTreeBuilder(catalog: catalog)
         self.trendAggregator = UsageTrendAggregator(catalog: catalog)
-        self.coworkImportRepository = CoWorkUsageImportRepository(catalog: catalog)
         self.homes = homes
         self.selectedRoot = homes.first(where: \.isActive)?.rootURL
             ?? homes.first(where: \.isAvailable)?.rootURL
@@ -211,7 +208,7 @@ final class DashboardViewModel: ObservableObject {
         loadGeneration += 1
         let generation = loadGeneration
         let registeredHomes = self.homes
-        let automaticHomes = automaticCoWorkHomes(excluding: registeredHomes)
+        let automaticHomes = automaticCodexHomes(excluding: registeredHomes)
         let allSources = registeredHomes + automaticHomes
         let automaticIDs = Set(automaticHomes.map(\.id))
         isLoading = true
@@ -249,32 +246,15 @@ final class DashboardViewModel: ObservableObject {
                 var loadedSource = false
                 var ordinaryLoadError: Error?
 
-                if !automaticIDs.contains(home.id) {
-                    do {
-                        let result = try await repository.load(from: home.rootURL)
-                        loadedSource = true
-                        issues.append(contentsOf: result.issues.map { namespacedIssue($0, home: home) })
-                        for report in result.reports {
-                            consider(LoadedUsageCandidate(home: home, report: report, importedTitle: nil))
-                        }
-                    } catch {
-                        ordinaryLoadError = error
-                    }
-                }
-
                 do {
-                    let imported = try await coworkImportRepository.load(from: home.rootURL)
-                    if imported.directoryExists { loadedSource = true }
-                    issues.append(contentsOf: imported.issues.map { namespacedIssue($0, home: home) })
-                    for item in imported.reports {
-                        consider(LoadedUsageCandidate(
-                            home: home,
-                            report: item.report,
-                            importedTitle: item.title
-                        ))
+                    let result = try await repository.load(from: home.rootURL)
+                    loadedSource = true
+                    issues.append(contentsOf: result.issues.map { namespacedIssue($0, home: home) })
+                    for report in result.reports {
+                        consider(LoadedUsageCandidate(home: home, report: report))
                     }
                 } catch {
-                    issues.append(homeIssue(home, suffix: "cowork-imports", message: error.localizedDescription))
+                    ordinaryLoadError = error
                 }
 
                 if loadedSource {
@@ -293,13 +273,13 @@ final class DashboardViewModel: ObservableObject {
             for (homeID, candidates) in grouped {
                 guard let home = candidates.first?.home else { continue }
                 titlesByHome[homeID] = await titleStore.titles(
-                    for: Set(candidates.filter { $0.importedTitle == nil }.map { $0.report.rootThreadId }),
+                    for: Set(candidates.filter { $0.report.displayName == nil }.map { $0.report.rootThreadId }),
                     codexRoot: home.rootURL
                 )
             }
 
             let rows = winners.values.map { candidate in
-                let title = candidate.importedTitle
+                let title = candidate.report.displayName
                     ?? titlesByHome[candidate.home.id]?[candidate.report.rootThreadId]
                 return namespace(
                     builder.build(report: candidate.report, title: title),
@@ -369,7 +349,7 @@ final class DashboardViewModel: ObservableObject {
 
     private func installMonitors() {
         stopMonitors()
-        let sources = homes.filter(\.isActive) + automaticCoWorkHomes(excluding: homes)
+        let sources = homes.filter(\.isActive) + automaticCodexHomes(excluding: homes)
         var monitoredPaths = Set<String>()
 
         func install(key: String, directory: URL, home: CodexHome) {
@@ -388,17 +368,12 @@ final class DashboardViewModel: ObservableObject {
             }
         }
 
-        for home in homes where home.isActive {
+        for home in sources where home.isActive {
             guard let directory = monitorDirectory(for: home) else {
                 appendIssueIfNeeded(homeIssue(home, suffix: "monitor", message: "目录不存在，无法监控"))
                 continue
             }
             install(key: "reports:\(home.id.uuidString)", directory: directory, home: home)
-        }
-
-        for home in sources {
-            guard let directory = coworkMonitorDirectory(for: home) else { continue }
-            install(key: "cowork:\(home.id.uuidString)", directory: directory, home: home)
         }
     }
 
@@ -414,29 +389,9 @@ final class DashboardViewModel: ObservableObject {
         return nil
     }
 
-    private func coworkMonitorDirectory(for home: CodexHome) -> URL? {
-        let imports = CoWorkUsageImportRepository.importsDirectory(for: home.rootURL)
-        let candidates = [
-            imports,
-            imports.deletingLastPathComponent(),
-            imports.deletingLastPathComponent().deletingLastPathComponent(),
-            home.rootURL.appendingPathComponent("token-usage", isDirectory: true),
-            home.rootURL
-        ]
-        for candidate in candidates {
-            var isDirectory: ObjCBool = false
-            if FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
-               isDirectory.boolValue {
-                return candidate
-            }
-        }
-        return nil
-    }
-
-    /// CoWork keeps its ephemeral App Server accounting in a dedicated Home.
-    /// Probe only that product-owned root; the importer itself opens only the
-    /// content-free token-usage/imports subtree.
-    private func automaticCoWorkHomes(excluding registered: [CodexHome]) -> [CodexHome] {
+    /// Product-owned Codex Homes may be offered as convenience inputs, but all
+    /// of them are loaded through the same token-usage/reports repository.
+    private func automaticCodexHomes(excluding registered: [CodexHome]) -> [CodexHome] {
         let userHome = FileManager.default.homeDirectoryForCurrentUser
         let candidates: [(UUID, URL)] = [
             (
@@ -463,7 +418,7 @@ final class DashboardViewModel: ObservableObject {
             guard seenPaths.insert(key).inserted else { return nil }
             return CodexHome(
                 id: id,
-                name: "CoWork（脱敏用量）",
+                name: "CoWork Codex Home",
                 rootURL: root,
                 isDefault: false,
                 isEnabled: true,

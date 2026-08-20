@@ -8,6 +8,7 @@ func reportV1Decoding() throws {
 
     #expect(report.reportSchemaVersion == 1)
     #expect(report.rootThreadId == "session-root")
+    #expect(report.displayName == "Synthetic report")
     #expect(report.selectedTurnId == "turn-main")
     #expect(report.task.usage.totalTokens == 190)
     #expect(report.task.usage.cachedInputTokens == 30)
@@ -297,6 +298,22 @@ func creditsAndAPIPricesAreBothEstimated() throws {
     #expect(estimator.estimateAPI([unknownContext]).amount == nil)
 }
 
+@Test("Standard reports without embedded public prices use the reader catalog")
+func standardReportPricingFallsBackToReaderCatalog() throws {
+    let data = try makeSyntheticReportData()
+    let text = try #require(String(data: data, encoding: .utf8))
+        .replacingOccurrences(of: "synthetic-model", with: "gpt-5.6-sol")
+    let report = try UsageReportDecoder.decode(Data(text.utf8))
+    let session = UsageTreeBuilder(catalog: try PricingCatalog.bundled()).build(
+        report: report,
+        title: report.displayName
+    )
+
+    #expect(session.name == "Synthetic report")
+    #expect(session.creditEstimate?.amount != nil)
+    #expect(session.apiPriceEstimate?.amount != nil)
+}
+
 @Test("Suppressed costs stay hidden and partial session prices prefer broader coverage")
 func sessionPriceSafetyRules() throws {
     let catalog = try PricingCatalog.bundled()
@@ -470,6 +487,7 @@ private func makeSyntheticReportData(
         "report_schema_version": schemaVersion,
         "generated_at": "2026-01-10T14:00:00.250Z",
         "root_thread_id": "session-root",
+        "display_name": "Synthetic report",
         "selected_turn_id": "turn-main",
         "current_turn": [
             "available": false,

@@ -9,7 +9,7 @@ public struct UsageTreeBuilder: Sendable {
 
     public func build(reports: [UsageReport], titles: [String: String]) -> [UsageTreeRow] {
         reports
-            .map { build(report: $0, title: titles[$0.rootThreadId]) }
+            .map { build(report: $0, title: titles[$0.rootThreadId] ?? $0.displayName) }
             .sorted { ($0.time ?? .distantPast) > ($1.time ?? .distantPast) }
     }
 
@@ -290,15 +290,25 @@ public struct UsageTreeBuilder: Sendable {
         let sessionCredit = pricingSuppressed
             ? nil
             : sessionCreditEstimate(report.task.cost, totalTokens: report.task.usage.totalTokens)
+                ?? estimator.estimate(
+                    report.task.segments,
+                    expectedTotalTokens: report.task.usage.totalTokens
+                )
         let sessionAPIPrice = pricingSuppressed
             ? nil
             : sessionAPIPriceEstimate(report.task.cost, totalTokens: report.task.usage.totalTokens)
+                ?? estimator.estimateAPI(
+                    report.task.segments,
+                    expectedTotalTokens: report.task.usage.totalTokens
+                )
 
         return UsageTreeRow(
             id: "session:\(report.rootThreadId)",
             kind: .session,
             time: sessionStart,
-            name: title?.nonEmpty ?? "会话 \(shortID(report.rootThreadId))",
+            name: title?.nonEmpty
+                ?? report.displayName?.nonEmpty
+                ?? "会话 \(shortID(report.rootThreadId))",
             ownUsage: report.task.rootUsage,
             subtreeUsage: report.task.usage,
             counts: report.task.counts,

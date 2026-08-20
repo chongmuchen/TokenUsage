@@ -388,6 +388,9 @@ public struct UsageReport: Codable, Equatable, Identifiable, Sendable {
     public let reportSchemaVersion: Int
     public let generatedAt: Date
     public let rootThreadId: String
+    /// Optional producer-supplied label for reports whose ephemeral thread has
+    /// no persisted state-database title. Readers remain source-agnostic.
+    public let displayName: String?
     public let selectedTurnId: String?
     public let currentTurn: CurrentTurnSummary
     public let task: TaskSummary

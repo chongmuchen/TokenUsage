@@ -23,6 +23,7 @@ public struct UsageTreeBuilder: Sendable {
         let totalUsage = TokenUsage.sum(topLevel.map(\.subtreeUsage))
         let ownUsage = TokenUsage.sum(topLevel.map(\.ownUsage))
         let counts = UsageCounts.sum(topLevel.map(\.counts))
+        let imageGenerations = topLevel.flatMap(\.imageGenerations)
         let allSegments = topLevel.flatMap(\.segments)
         let credit = aggregateCredits(topLevel, totalTokens: totalUsage.totalTokens)
         let apiPrice = aggregateAPIPrices(topLevel, totalTokens: totalUsage.totalTokens)
@@ -38,6 +39,7 @@ public struct UsageTreeBuilder: Sendable {
             ownUsage: ownUsage,
             subtreeUsage: totalUsage,
             counts: counts,
+            imageGenerations: imageGenerations,
             segments: allSegments,
             modelSummary: estimator.modelSummary(for: allSegments),
             creditEstimate: credit,
@@ -53,6 +55,7 @@ public struct UsageTreeBuilder: Sendable {
         let threadByID = Dictionary(report.threads.map { ($0.threadId, $0) }, uniquingKeysWith: { first, _ in first })
         let root = threadByID[report.rootThreadId]
         let pricingSuppressed = report.task.cost.costSuppressed == true
+        let reportImageGenerations = report.imageGenerationDetails
         var attributionWarnings: [String] = []
         var ownerCandidates: [String: Set<Owner>] = [:]
         var parentMetadataConflicts = Set<String>()
@@ -111,6 +114,33 @@ public struct UsageTreeBuilder: Sendable {
 
         var renderedThreadIDs = Set<String>()
 
+        func detailBelongsToThread(_ detail: ImageGenerationDetail, threadID: String) -> Bool {
+            if let detailThreadID = detail.threadId {
+                return detailThreadID == threadID
+            }
+            guard let turnID = detail.turnId, let thread = threadByID[threadID] else { return false }
+            return thread.turns.contains { $0.turnId == turnID }
+        }
+
+        func imageGenerations(threadID: String, turnID: String) -> [ImageGenerationDetail] {
+            reportImageGenerations.filter {
+                $0.turnId == turnID && detailBelongsToThread($0, threadID: threadID)
+            }
+        }
+
+        func unmatchedImageGenerations(thread: ThreadSummary) -> [ImageGenerationDetail] {
+            let knownTurnIDs = Set(thread.turns.map(\.turnId))
+            return reportImageGenerations.filter { detail in
+                guard detailBelongsToThread(detail, threadID: thread.threadId) else { return false }
+                guard let turnID = detail.turnId else { return true }
+                return !knownTurnIDs.contains(turnID)
+            }
+        }
+
+        func ownThreadImageGenerations(threadID: String) -> [ImageGenerationDetail] {
+            reportImageGenerations.filter { detailBelongsToThread($0, threadID: threadID) }
+        }
+
         func childThreadIDs(parentThreadID: String, parentTurnID: String) -> [String] {
             ownerByChild
                 .filter { $0.value.parentThreadID == parentThreadID && $0.value.parentTurnID == parentTurnID }
@@ -133,6 +163,7 @@ public struct UsageTreeBuilder: Sendable {
                 .compactMap { buildThreadRow(threadID: $0, path: path) }
             let childUsage = TokenUsage.sum(childRows.map(\.subtreeUsage))
             let childCounts = UsageCounts.sum(childRows.map(\.counts))
+            let childImageGenerations = childRows.flatMap(\.imageGenerations)
             let subtreeSegments = turn.segments + childRows.flatMap(\.segments)
             let rowAttribution: AttributionKind = main ? .direct : .direct
             return makeRow(
@@ -143,6 +174,10 @@ public struct UsageTreeBuilder: Sendable {
                 ownUsage: turn.usage,
                 subtreeUsage: turn.usage + childUsage,
                 counts: turn.counts + childCounts,
+                imageGenerations: imageGenerations(
+                    threadID: thread.threadId,
+                    turnID: turn.turnId
+                ) + childImageGenerations,
                 segments: subtreeSegments,
                 attribution: rowAttribution,
                 pricingSuppressed: pricingSuppressed,
@@ -182,6 +217,7 @@ public struct UsageTreeBuilder: Sendable {
                         ownUsage: residualUsage,
                         subtreeUsage: residualUsage,
                         counts: residualCounts,
+                        imageGenerations: unmatchedImageGenerations(thread: thread),
                         segments: [],
                         attribution: .unattributed,
                         pricingSuppressed: pricingSuppressed,
@@ -195,6 +231,7 @@ public struct UsageTreeBuilder: Sendable {
             let descendantRows = turnRows.flatMap { $0.children ?? [] }
             let descendantUsage = TokenUsage.sum(descendantRows.map(\.subtreeUsage))
             let descendantCounts = UsageCounts.sum(descendantRows.map(\.counts))
+            let descendantImageGenerations = descendantRows.flatMap(\.imageGenerations)
             let descendantSegments = descendantRows.flatMap(\.segments)
             let owner = ownerByChild[threadID]
             let attribution = owner?.attribution ?? .unattributed
@@ -208,6 +245,8 @@ public struct UsageTreeBuilder: Sendable {
                 ownUsage: thread.usage,
                 subtreeUsage: thread.usage + descendantUsage,
                 counts: thread.counts + descendantCounts,
+                imageGenerations: ownThreadImageGenerations(threadID: threadID)
+                    + descendantImageGenerations,
                 segments: thread.segments + descendantSegments,
                 attribution: attribution,
                 pricingSuppressed: pricingSuppressed,
@@ -238,6 +277,7 @@ public struct UsageTreeBuilder: Sendable {
                         ownUsage: residualUsage,
                         subtreeUsage: residualUsage,
                         counts: residualCounts,
+                        imageGenerations: unmatchedImageGenerations(thread: root),
                         segments: [],
                         attribution: .unattributed,
                         pricingSuppressed: pricingSuppressed,
@@ -262,6 +302,7 @@ public struct UsageTreeBuilder: Sendable {
         if !sideRows.isEmpty {
             let sideUsage = TokenUsage.sum(sideRows.map(\.subtreeUsage))
             let sideCounts = UsageCounts.sum(sideRows.map(\.counts))
+            let sideImageGenerations = sideRows.flatMap(\.imageGenerations)
             let sideSegments = sideRows.flatMap(\.segments)
             rootTurnRows.append(
                 makeRow(
@@ -272,6 +313,7 @@ public struct UsageTreeBuilder: Sendable {
                     ownUsage: .zero,
                     subtreeUsage: sideUsage,
                     counts: sideCounts,
+                    imageGenerations: sideImageGenerations,
                     segments: sideSegments,
                     attribution: .unattributed,
                     pricingSuppressed: pricingSuppressed,
@@ -312,6 +354,7 @@ public struct UsageTreeBuilder: Sendable {
             ownUsage: report.task.rootUsage,
             subtreeUsage: report.task.usage,
             counts: report.task.counts,
+            imageGenerations: reportImageGenerations,
             segments: report.task.segments,
             modelSummary: estimator.modelSummary(for: report.task.segments),
             creditEstimate: sessionCredit,
@@ -332,6 +375,7 @@ public struct UsageTreeBuilder: Sendable {
         ownUsage: TokenUsage,
         subtreeUsage: TokenUsage,
         counts: UsageCounts,
+        imageGenerations: [ImageGenerationDetail] = [],
         segments: [UsageSegment],
         attribution: AttributionKind,
         pricingSuppressed: Bool,
@@ -348,6 +392,7 @@ public struct UsageTreeBuilder: Sendable {
             ownUsage: ownUsage,
             subtreeUsage: subtreeUsage,
             counts: counts,
+            imageGenerations: imageGenerations,
             segments: segments,
             modelSummary: estimator.modelSummary(for: segments),
             creditEstimate: pricingSuppressed

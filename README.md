@@ -2,7 +2,7 @@
 
 `TokenUsage` 是一个 macOS 14+ 原生 SwiftUI 应用，用来查看一个或多个 Codex Home 中的本地 token-usage report v1。它只读取本机数据，既能按日绘制 Token 与价格趋势，也能构建“会话 → 主对话 → 子代理线程 → 子代理轮次”的明细树；不会发起模型请求，也不会向原 Codex 对话上下文写入内容。
 
-表格第一列是会话/对话时间，第二列是名称。会话名称来自本地 Codex 状态库中首次用户消息的前 36 个字符，允许重名；会自动剥离 `# Files mentioned by the user:`、附件路径、`Distinguish instructions...` 和 `## My request:` 等 Codex 附件信封，只保留实际请求。没有可用标题时回退为短会话 ID。展开会话后，可以看到主对话、明确关联的子代理、按唯一时间窗口推断的子代理，以及无法安全归属时单列的“侧边 / 无法唯一归属”组。
+表格第一列是会话/对话时间，第二列是名称。会话名称来自本地 Codex 状态库中首次用户消息的前 36 个字符，允许重名；会自动剥离 `# Files mentioned by the user:`、附件路径、`Distinguish instructions...` 和 `## My request:` 等 Codex 附件信封，只保留实际请求。没有可用标题时回退为短会话 ID。展开会话后，可以看到主对话、明确关联的子代理、按唯一时间窗口推断的子代理，以及无法安全归属时单列的“侧边 / 无法唯一归属”组。存在图片生成时，名称旁会显示“图片 N”徽标；点击可查看用户输入提示词、模型修订提示词、请求/返回尺寸和质量，以及实际输出尺寸、格式与字节数。旧报告只有次数而没有详情时会显示“未记录详情”，其余字段留空。
 
 所有 token、Credits 和 API USD 数值均右对齐并固定显示两位小数，便于逐行比较。Token 使用 `k`、`M`、`B` 缩写，悬停可查看精确整数。表格最后一行是“当前筛选汇总”，只累加当前日期和 Token 条件下可见的顶层会话；不会再次累加展开后的子对话。输出与推理继续分别显示，其中推理 token 是输出的子集。
 
@@ -46,7 +46,7 @@ open ".build/app/Token Usage.app"
 
 - 普通刷新只读 `token-usage/reports/*.json`，并只读 `state_*.sqlite` 的 `first_user_message` 来生成短标题。
 - “同步当前日期范围”会运行随 App 打包的本地解析器，为日期范围内尚无报告的用户会话生成 per-session JSON/TXT。它不会调用 Codex 模型或 OpenAI API，也不会覆盖实时的 `latest.json/latest.txt`。
-- 解析器只提取计量所需白名单字段，不把 prompt、工具参数、工具输出或图片内容写入 App 报告。
+- 解析器只提取计量所需白名单字段。图片生成可额外记录用户输入提示词和模型 `revised_prompt` 的空白归一化预览（各最多 240 个字符及截断标记），以及尺寸、质量、格式、像素和字节数等标量；不会写入完整 prompt、普通工具参数/输出、图片内容或图片路径。
 - App 不联网、不使用 MCP，也不把 `/status` 或任何提示注入会话，因此不会增加模型 token 或影响原任务上下文。
 
 ### App Server 标准报告
@@ -57,12 +57,13 @@ TokenUsage 会把 CoWork 的专用目录作为一个普通 Codex Home 自动加�
 <CODEX_HOME>/token-usage/reports/*.json
 ```
 
-CoWork 继续使用 `ephemeral: true` 的 App Server 线程，不需要开启 Codex Hook，也不会为了统计而落盘 prompt、回复、图片、工具参数、认证信息或工作目录。它用 `thread/tokenUsage/updated` 中的累计 `total` 计算增量，并直接原子写出权限为 `0600` 的 report v1。后台只接收 `CODEX_HOME`，不需要识别 CoWork 或专用导入格式；其他 App Server 客户端只要生成相同 report，也能直接复用。
+CoWork 继续使用 `ephemeral: true` 的 App Server 线程，不需要开启 Codex Hook。在线程销毁前，它会把实际 `request.prompt` 和模型 `revised_prompt` 写成各最多 240 个字符的预览，并记录请求/返回尺寸与质量、实际输出尺寸、格式和字节数；不会落盘完整 prompt、回复、图片内容、图片路径、普通工具参数、认证信息或工作目录。它用 `thread/tokenUsage/updated` 中的累计 `total` 计算增量，并直接原子写出权限为 `0600` 的 report v1。后台只接收 `CODEX_HOME`，不需要识别 CoWork 或专用导入格式；其他 App Server 客户端只要生成相同 report，也能直接复用。
 
 - 只统计升级后的 CoWork 运行。旧 SwiftData 记录只保存最后一次响应的 `last`，缺少累计量、缓存写和实际 Codex 配置，无法无损回填，因而不会伪装成完整历史。
+- `image_generations` 是 report v1 的可选字段；旧报告或字段不完整的记录仍可正常读取，界面相应位置显示为空，不会报错。
 - 第一版短期使用的 `token-usage/imports/cowork/v1` 会在新版 CoWork 下次启动时一次性转换为标准 report；单个旧文件只有在报告安全落盘后才会删除。
 - 运行中、失败或中断的记录按“已观测下界”显示；累计计数回退、字段关系错误或无法对账时拒绝导入或抑制价格。
-- 这里统计的是驱动 CoWork 工作流的 Codex 控制回合。图片生成模型自身的 token、图片尺寸/质量价格和其他工具按次费用不包含在内。
+- 这里统计的是驱动 CoWork 工作流的 Codex 控制回合。报告虽可显示图片尺寸/质量元数据，但图片生成模型自身的 token、图片尺寸/质量价格和其他工具按次费用不包含在内。
 - CoWork 能取得后端 credits 估计时，会话 Credits 优先显示该值；趋势中的分钟价格与 API USD 仍是 TokenUsage 静态公开价目下的等价估算，并非实际订阅或 API 账单。
 - 当前非沙箱构建可自动读取 CoWork Codex Home；如果以后启用 App Sandbox，需要在“Codex Home”菜单中显式授权该目录，或为两个 App 配置共享容器。
 
@@ -112,7 +113,7 @@ Codex 官方说明 Hook transcript 的格式不是稳定公共接口，因此将
 - `API USD 等价` 是相同 token 按默认公共 API token 价的等价估算，不是 ChatGPT/Codex 订阅的实际美元扣款，也不包含区域加价、工具调用、图片生成等额外费用。
 - 配置档位来自本地会话记录，不等于服务端确认的实际执行档位；服务端可能降级，因此所有金额均以 `≈` 标记。
 - 缓存读/写、reasoning 的包含关系不会二次计价；缺公开价的模型只显示已定价部分或 `—`。
-- 图片输入 token 已折入 input，但 report v1 无法从总 input 中单独拆出；图片生成、Web/File Search、容器、存储和外部 MCP 的按次费用也无法完整还原。
+- 图片输入 token 已折入 input，但 report v1 无法从总 input 中单独拆出；图片生成详情中的尺寸/质量仅供查看，Web/File Search、图片生成、容器、存储和外部 MCP 的按次费用仍无法完整还原。
 
 ## 测试
 

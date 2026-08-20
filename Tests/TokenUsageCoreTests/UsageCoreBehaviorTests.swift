@@ -14,6 +14,7 @@ func reportV1Decoding() throws {
     #expect(report.task.usage.cachedInputTokens == 30)
     #expect(report.task.usage.ordinaryInputTokens == 118)
     #expect(report.threads.count == 4)
+    #expect(report.imageGenerations == nil)
 
     let segment = try #require(report.task.segments.first)
     #expect(segment.model == "synthetic-model")
@@ -21,6 +22,49 @@ func reportV1Decoding() throws {
     #expect(segment.firstAt != nil)
     #expect(segment.lastAt != nil)
     #expect(segment.requestCount == 4)
+}
+
+@Test("Optional image-generation details decode and follow their turn through the tree")
+func optionalImageGenerationDetails() throws {
+    let base = try #require(
+        JSONSerialization.jsonObject(with: makeSyntheticReportData()) as? [String: Any]
+    )
+    var object = base
+    object["image_generations"] = [[
+        "id": "image-call-hash",
+        "thread_id": "session-root",
+        "turn_id": "turn-main",
+        "generated_at": "2026-01-10T12:00:30Z",
+        "status": "completed",
+        "user_prompt_preview": "用户输入预览",
+        "user_prompt_truncated": false,
+        "revised_prompt_preview": "生成提示词预览",
+        "revised_prompt_truncated": true,
+        "requested_size": "1024x1024",
+        "requested_quality": "high",
+        "actual_width": 1536,
+        "actual_height": 1024,
+        "output_format": "png",
+        "output_bytes": 123_456
+    ], [:]]
+
+    let report = try UsageReportDecoder.decode(
+        JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    )
+    let detail = try #require(report.imageGenerationDetails.first)
+    #expect(report.imageGenerationDetails.count == 2)
+    #expect(report.imageGenerationDetails[1].id == nil)
+    #expect(detail.userPromptPreview == "用户输入预览")
+    #expect(detail.revisedPromptTruncated == true)
+    #expect(detail.actualWidth == 1536)
+
+    let session = UsageTreeBuilder(catalog: try PricingCatalog.bundled()).build(
+        report: report,
+        title: nil
+    )
+    let mainTurn = try #require(session.children?.first { $0.kind == .mainTurn })
+    #expect(session.imageGenerations.count == 2)
+    #expect(mainTurn.imageGenerations == [detail])
 }
 
 @Test("Unsupported report schema is rejected before full decoding")

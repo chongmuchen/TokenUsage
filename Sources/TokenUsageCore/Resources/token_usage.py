@@ -12,11 +12,14 @@ fails open when a future format is not understood.
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import struct
 import sys
 import unicodedata
 from contextlib import contextmanager
@@ -29,9 +32,11 @@ from urllib.parse import quote
 from uuid import UUID
 
 
-CACHE_SCHEMA_VERSION = 9
+CACHE_SCHEMA_VERSION = 10
 CHECKPOINT_BYTES = 4096
 REPORT_SCHEMA_VERSION = 1
+PROMPT_PREVIEW_CHARACTERS = 240
+IMAGE_HEADER_BYTES = 256 * 1024
 USAGE_FIELDS = (
     "input_tokens",
     "cached_input_tokens",
@@ -221,6 +226,179 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _request_heading_body(line: str) -> Optional[str]:
+    match = re.match(
+        r"^\s*#{1,6}\s*(?:my\s+request(?:\s+for\s+codex)?|我的请求)\s*:?[ \t]*(.*)$",
+        line,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def _is_attachment_header(line: str) -> bool:
+    return re.match(
+        r"^\s{0,3}#{1,6}\s*(?:(?:files?\s+(?:mentioned|metioned|attached|uploaded)\s+by\s+(?:the\s+)?user)|(?:(?:attached|uploaded)\s+files?))\s*:?\s*$",
+        line,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _is_attachment_directive(line: str) -> bool:
+    lowered = line.strip().lower()
+    return (
+        lowered.startswith("distinguish instructions")
+        and ("attached" in lowered or "uploaded" in lowered)
+        and "request" in lowered
+    )
+
+
+def _is_attached_file_entry(line: str) -> bool:
+    if not line.lstrip().startswith("#") or ":" not in line:
+        return False
+    value = line.split(":", 1)[1].strip()
+    return bool(
+        value.startswith(("/", "~", "file://", "http://", "https://"))
+        or re.match(r"^[A-Za-z]:[\\/]", value)
+        or "codex-clipboard-" in value
+    )
+
+
+def _user_request_text(value: str) -> str:
+    text = value.replace("\ufeff", "").replace("\0", "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    first_index = next((index for index, line in enumerate(lines) if line.strip()), None)
+    if first_index is None:
+        return text
+    inline = _request_heading_body(lines[first_index])
+    if inline is not None:
+        return "\n".join([inline] + lines[first_index + 1 :])
+    if not (
+        _is_attachment_header(lines[first_index])
+        or _is_attachment_directive(lines[first_index])
+    ):
+        return text
+    for index in range(first_index + 1, len(lines)):
+        line = lines[index].strip()
+        inline = _request_heading_body(line)
+        if inline is not None:
+            return "\n".join([inline] + lines[index + 1 :])
+        if (
+            not line
+            or _is_attachment_header(line)
+            or _is_attachment_directive(line)
+            or _is_attached_file_entry(line)
+        ):
+            continue
+        return "\n".join(lines[index:])
+    return ""
+
+
+def _text_preview(value: Any, user_message: bool = False) -> Tuple[Optional[str], Optional[bool]]:
+    if not isinstance(value, str):
+        return None, None
+    source = _user_request_text(value) if user_message else value
+    normalized = " ".join(source.split()).strip()
+    if not normalized:
+        return None, None
+    if len(normalized) <= PROMPT_PREVIEW_CHARACTERS:
+        return normalized, False
+    return normalized[: PROMPT_PREVIEW_CHARACTERS - 1] + "…", True
+
+
+def _image_dimensions(header: bytes) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+    if len(header) >= 24 and header.startswith(b"\x89PNG\r\n\x1a\n"):
+        width, height = struct.unpack(">II", header[16:24])
+        return "png", width or None, height or None
+    if len(header) >= 10 and header[:6] in {b"GIF87a", b"GIF89a"}:
+        width, height = struct.unpack("<HH", header[6:10])
+        return "gif", width or None, height or None
+    if len(header) >= 30 and header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        chunk = header[12:16]
+        if chunk == b"VP8X":
+            width = 1 + int.from_bytes(header[24:27], "little")
+            height = 1 + int.from_bytes(header[27:30], "little")
+            return "webp", width, height
+        if chunk == b"VP8L" and header[20] == 0x2F:
+            bits = int.from_bytes(header[21:25], "little")
+            return "webp", (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if chunk == b"VP8 " and header[23:26] == b"\x9d\x01\x2a":
+            width = int.from_bytes(header[26:28], "little") & 0x3FFF
+            height = int.from_bytes(header[28:30], "little") & 0x3FFF
+            return "webp", width or None, height or None
+        return "webp", None, None
+    if len(header) >= 4 and header.startswith(b"\xff\xd8"):
+        index = 2
+        start_of_frame = {
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+        }
+        while index + 8 <= len(header):
+            while index < len(header) and header[index] != 0xFF:
+                index += 1
+            while index < len(header) and header[index] == 0xFF:
+                index += 1
+            if index >= len(header):
+                break
+            marker = header[index]
+            index += 1
+            if marker in {0x01, *range(0xD0, 0xD9)}:
+                continue
+            if marker == 0xDA or index + 2 > len(header):
+                break
+            length = int.from_bytes(header[index : index + 2], "big")
+            if length < 2 or index + length > len(header):
+                break
+            if marker in start_of_frame and length >= 7:
+                height = int.from_bytes(header[index + 3 : index + 5], "big")
+                width = int.from_bytes(header[index + 5 : index + 7], "big")
+                return "jpeg", width or None, height or None
+            index += length
+        return "jpeg", None, None
+    return None, None, None
+
+
+def _base64_image_metadata(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, str) or not value:
+        return {}
+    encoded = value.split(",", 1)[1] if value.startswith("data:") and "," in value else value
+    encoded = re.sub(r"\s+", "", encoded)
+    if not encoded or len(encoded) > 70_000_000:
+        return {}
+    if re.fullmatch(r"[A-Za-z0-9+/=_-]+", encoded) is None:
+        return {}
+    unpadded = encoded.rstrip("=")
+    output_bytes = (len(unpadded) * 6) // 8
+    prefix_characters = min(
+        len(encoded),
+        ((IMAGE_HEADER_BYTES + 2) // 3) * 4,
+    )
+    prefix_characters -= prefix_characters % 4
+    try:
+        header = base64.b64decode(
+            encoded[:prefix_characters] + "=" * ((-prefix_characters) % 4),
+            altchars=b"-_",
+            validate=False,
+        )
+    except (ValueError, TypeError):
+        return {}
+    output_format, width, height = _image_dimensions(header)
+    result: Dict[str, Any] = {"output_bytes": output_bytes}
+    if output_format:
+        result["output_format"] = output_format
+    if width:
+        result["actual_width"] = width
+    if height:
+        result["actual_height"] = height
+    return result
+
+
+def _call_digest(field: str, value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(f"{field}\0{value}".encode("utf-8", "replace")).hexdigest()[:24]
+
+
 def _append_warning(state: Dict[str, Any], warning: str) -> None:
     warnings = state.setdefault("warnings", [])
     if warning not in warnings and len(warnings) < 50:
@@ -283,6 +461,9 @@ def _new_parser_state(transcript_path: Path, stat_result: os.stat_result) -> Dic
         "task_boundaries": [],
         "turn_order": [],
         "turns": {},
+        "turn_user_prompts": {},
+        "pending_user_prompt": None,
+        "image_generation_details": [],
         "unattributed_segments": [],
         "usage_samples": [],
         "unattributed_counts": _zero_counts(),
@@ -461,15 +642,15 @@ def _add_segment(container: List[Dict[str, Any]], metadata: Dict[str, Any], usag
 
 def _increment_count(
     state: Dict[str, Any], field: str, amount: int = 1, dedupe_key: Any = None
-) -> None:
+) -> bool:
     if field not in COUNT_FIELDS or amount <= 0:
-        return
-    if isinstance(dedupe_key, str) and dedupe_key:
-        digest = hashlib.sha256(f"{field}\0{dedupe_key}".encode("utf-8", "replace")).hexdigest()[:24]
+        return False
+    digest = _call_digest(field, dedupe_key)
+    if digest:
         seen_by_field = state.setdefault("seen_call_hashes", {})
         seen = seen_by_field.setdefault(field, [])
         if digest in seen:
-            return
+            return False
         if len(seen) < 100000:
             seen.append(digest)
     active_turn_id = state.get("active_turn_id")
@@ -478,6 +659,19 @@ def _increment_count(
     target[field] = _as_int(target.get(field)) + amount
     raw_counts = state.setdefault("raw_counts", _zero_counts())
     raw_counts[field] = _as_int(raw_counts.get(field)) + amount
+    return True
+
+
+def _remember_user_prompt(state: Dict[str, Any], value: Any) -> None:
+    preview, truncated = _text_preview(value, user_message=True)
+    if preview is None:
+        return
+    prompt = {"text": preview, "truncated": bool(truncated)}
+    turn_id = state.get("active_turn_id")
+    if isinstance(turn_id, str) and turn_id:
+        state.setdefault("turn_user_prompts", {})[turn_id] = prompt
+    else:
+        state["pending_user_prompt"] = prompt
 
 
 def _process_record(state: Dict[str, Any], record: Dict[str, Any]) -> None:
@@ -535,6 +729,17 @@ def _process_record(state: Dict[str, Any], record: Dict[str, Any]) -> None:
                 sum(1 for item in content if isinstance(item, dict) and item.get("type") == "input_audio"),
                 message_id,
             )
+            text = "\n".join(
+                item.get("text")
+                for item in content
+                if isinstance(item, dict)
+                and item.get("type") in {"input_text", "text"}
+                and isinstance(item.get("text"), str)
+            )
+            turn_id = state.get("active_turn_id")
+            prompts = state.setdefault("turn_user_prompts", {})
+            if text and not (isinstance(turn_id, str) and turn_id in prompts):
+                _remember_user_prompt(state, text)
         elif item_type in {"function_call", "custom_tool_call"}:
             _increment_count(state, "tool_calls", dedupe_key=payload.get("call_id") or payload.get("id"))
         return
@@ -543,6 +748,10 @@ def _process_record(state: Dict[str, Any], record: Dict[str, Any]) -> None:
         return
 
     event_type = payload.get("type")
+    if event_type == "user_message":
+        _remember_user_prompt(state, payload.get("message"))
+        return
+
     if event_type == "thread_settings_applied":
         settings = payload.get("thread_settings") if isinstance(payload.get("thread_settings"), dict) else {}
         model = settings.get("model")
@@ -574,6 +783,10 @@ def _process_record(state: Dict[str, Any], record: Dict[str, Any]) -> None:
             if turn:
                 turn["start_sequence"] = boundary["record_sequence"]
                 turn["task_epoch"] = boundary["task_epoch"]
+                pending_prompt = state.get("pending_user_prompt")
+                if isinstance(pending_prompt, dict):
+                    state.setdefault("turn_user_prompts", {})[turn_id] = pending_prompt
+                    state["pending_user_prompt"] = None
         return
 
     if event_type == "task_complete":
@@ -656,7 +869,38 @@ def _process_record(state: Dict[str, Any], record: Dict[str, Any]) -> None:
         return
 
     if event_type == "image_generation_end":
-        _increment_count(state, "image_generations", dedupe_key=payload.get("call_id"))
+        call_id = payload.get("call_id")
+        if _increment_count(state, "image_generations", dedupe_key=call_id):
+            turn_id = state.get("active_turn_id")
+            detail_id = _call_digest("image_generations", call_id)
+            if detail_id is None:
+                detail_id = hashlib.sha256(
+                    f"image_generations\0{state.get('record_sequence')}\0{timestamp}".encode(
+                        "utf-8", "replace"
+                    )
+                ).hexdigest()[:24]
+            detail: Dict[str, Any] = {
+                "id": detail_id,
+                "turn_id": turn_id if isinstance(turn_id, str) else None,
+                "generated_at": timestamp if isinstance(timestamp, str) else None,
+                "status": payload.get("status")[:64]
+                if isinstance(payload.get("status"), str)
+                else None,
+                "_record_sequence": _as_int(state.get("record_sequence")),
+                "_task_epoch": _as_int(state.get("task_epoch")),
+            }
+            prompt = state.setdefault("turn_user_prompts", {}).get(turn_id)
+            if isinstance(prompt, dict) and isinstance(prompt.get("text"), str):
+                detail["user_prompt_preview"] = prompt["text"]
+                detail["user_prompt_truncated"] = bool(prompt.get("truncated"))
+            revised_prompt, revised_truncated = _text_preview(payload.get("revised_prompt"))
+            if revised_prompt is not None:
+                detail["revised_prompt_preview"] = revised_prompt
+                detail["revised_prompt_truncated"] = bool(revised_truncated)
+            detail.update(_base64_image_metadata(payload.get("result")))
+            details = state.setdefault("image_generation_details", [])
+            if len(details) < 100_000:
+                details.append({key: value for key, value in detail.items() if value is not None})
     elif event_type == "web_search_end":
         _increment_count(state, "web_searches", dedupe_key=payload.get("call_id"))
     elif event_type == "mcp_tool_call_end":
@@ -997,6 +1241,46 @@ def _owned_usage_samples(
     return [sample for sample in samples if _as_int(sample.get("task_epoch")) >= boundary_epoch]
 
 
+def _owned_image_generations(
+    state: Dict[str, Any],
+    boundary: Optional[Dict[str, Any]],
+    owned_turn_ids: Sequence[str],
+) -> List[Dict[str, Any]]:
+    details = (
+        state.get("image_generation_details")
+        if isinstance(state.get("image_generation_details"), list)
+        else []
+    )
+    if not state.get("forked_from_id"):
+        selected = details
+    elif boundary is None:
+        selected = []
+    else:
+        owned = set(owned_turn_ids)
+        boundary_sequence = _as_int(boundary.get("record_sequence"))
+        selected = [
+            detail
+            for detail in details
+            if isinstance(detail, dict)
+            and (
+                detail.get("turn_id") in owned
+                or (
+                    not isinstance(detail.get("turn_id"), str)
+                    and _as_int(detail.get("_record_sequence")) >= boundary_sequence
+                )
+            )
+        ]
+    return [
+        {
+            key: value
+            for key, value in detail.items()
+            if isinstance(key, str) and not key.startswith("_")
+        }
+        for detail in selected
+        if isinstance(detail, dict)
+    ]
+
+
 def _merge_usage_samples(values: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
     for value in values:
@@ -1045,6 +1329,9 @@ def _thread_summary(
     unattributed = _unattributed_owned_segments(state, boundary)
     owned_segments = [segment for turn in owned_turns for segment in turn.get("segments", [])] + unattributed
     owned_samples = _owned_usage_samples(state, boundary)
+    owned_image_generations = _owned_image_generations(state, boundary, owned_ids)
+    for detail in owned_image_generations:
+        detail["thread_id"] = thread_id
     raw_usage = _usage_from(state.get("raw_usage"))
     boundary_resolved = not state.get("forked_from_id") or boundary is not None
     if state.get("forked_from_id") and boundary is None:
@@ -1094,6 +1381,7 @@ def _thread_summary(
         # Private build-report plane. It is removed before thread summaries are
         # serialized so the report contains one, and only one, timeline copy.
         "_usage_samples": owned_samples,
+        "_image_generations": owned_image_generations,
         "warnings": list(dict.fromkeys(warnings)),
         "parse_errors": _as_int(state.get("parse_errors")),
         "unclassified_compaction_total": _as_int(state.get("unclassified_compaction_total")),
@@ -1598,11 +1886,24 @@ def build_report(
         for summary in summaries.values()
         for sample in (summary.get("_usage_samples") or [])
     )
+    task_image_generations = [
+        detail
+        for summary in summaries.values()
+        for detail in (summary.get("_image_generations") or [])
+        if isinstance(detail, dict)
+    ]
+    task_image_generations.sort(
+        key=lambda detail: (
+            str(detail.get("generated_at") or ""),
+            str(detail.get("id") or ""),
+        )
+    )
     # Do not serialize minute samples beneath thread/turn breakdowns. Those
     # structures intentionally repeat accounting views and would invite double
     # counting by consumers.
     for summary in summaries.values():
         summary.pop("_usage_samples", None)
+        summary.pop("_image_generations", None)
 
     catalog = _load_catalog()
     report_warnings = list(graph_warnings)
@@ -1665,6 +1966,7 @@ def build_report(
         "generated_at": _now_iso(),
         "root_thread_id": root_id,
         "selected_turn_id": turn_id,
+        "image_generations": task_image_generations,
         "current_turn": {
             "available": selected_turn is not None,
             "usage_is_provisional": current_provisional,

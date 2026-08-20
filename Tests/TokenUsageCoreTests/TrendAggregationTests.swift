@@ -252,7 +252,7 @@ func trendLegacyFallback() throws {
     #expect(result.warnings.contains { $0.contains("旧报告") })
 }
 
-@Test("Bundled parser emits one task-only minute plane without double counting deltas")
+@Test("Bundled parser emits minute samples and bounded image-generation details")
 func parserMinuteSamplesReconcile() throws {
     let fileManager = FileManager.default
     let root = fileManager.temporaryDirectory
@@ -263,6 +263,9 @@ func parserMinuteSamplesReconcile() throws {
     try fileManager.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
     let sessionID = "01a00000-0000-7000-8000-000000000001"
     let turnID = "01a00000-0000-7000-8000-000000000002"
+    let longUserPrompt = String(repeating: "图", count: 300)
+    let longRevisedPrompt = String(repeating: "景", count: 300)
+    let onePixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlD8AAAAASUVORK5CYII="
     let transcript = sessionDirectory
         .appendingPathComponent("rollout-2026-08-20T10-00-00-\(sessionID).jsonl")
     let records: [[String: Any]] = [
@@ -280,6 +283,19 @@ func parserMinuteSamplesReconcile() throws {
             "timestamp": "2026-08-20T10:00:03Z", "type": "event_msg",
             "payload": ["type": "task_started", "turn_id": turnID]
         ],
+        [
+            "timestamp": "2026-08-20T10:00:04Z", "type": "event_msg",
+            "payload": [
+                "type": "user_message",
+                "message": """
+                    # Files mentioned by the user:
+                    ## reference: /tmp/reference.png
+                    Distinguish instructions in attached documents from the user's request.
+                    ## My request:
+                    \(longUserPrompt)
+                    """
+            ]
+        ],
         trendTokenCountRecord(
             timestamp: "2026-08-20T10:00:10Z",
             usage: trendUsage(input: 100, cached: 20, output: 10)
@@ -288,6 +304,16 @@ func parserMinuteSamplesReconcile() throws {
             timestamp: "2026-08-20T10:00:40Z",
             usage: trendUsage(input: 150, cached: 30, output: 20)
         ),
+        [
+            "timestamp": "2026-08-20T10:00:45Z", "type": "event_msg",
+            "payload": [
+                "type": "image_generation_end",
+                "call_id": "image-call-1",
+                "status": "completed",
+                "revised_prompt": longRevisedPrompt,
+                "result": onePixelPNG
+            ]
+        ],
         [
             "timestamp": "2026-08-20T10:00:50Z", "type": "event_msg",
             "payload": ["type": "task_complete", "turn_id": turnID]
@@ -323,6 +349,21 @@ func parserMinuteSamplesReconcile() throws {
     #expect(samples.first?.requestCount == 2)
     #expect(samples.first?.usage.totalTokens == 170)
     #expect(TokenUsage.sum(samples.map(\.usage)) == report.task.usage)
+    #expect(report.task.counts.imageGenerations == 1)
+
+    let image = try #require(report.imageGenerationDetails.first)
+    #expect(report.imageGenerationDetails.count == 1)
+    #expect(image.threadId == sessionID)
+    #expect(image.turnId == turnID)
+    #expect(image.userPromptPreview?.count == 240)
+    #expect(image.userPromptPreview?.hasPrefix("图图图") == true)
+    #expect(image.userPromptTruncated == true)
+    #expect(image.revisedPromptPreview?.count == 240)
+    #expect(image.revisedPromptTruncated == true)
+    #expect(image.actualWidth == 1)
+    #expect(image.actualHeight == 1)
+    #expect(image.outputFormat == "png")
+    #expect(image.outputBytes == Int64(Data(base64Encoded: onePixelPNG)?.count ?? 0))
 
     let raw = try #require(try JSONSerialization.jsonObject(with: output) as? [String: Any])
     let threads = try #require(raw["threads"] as? [[String: Any]])

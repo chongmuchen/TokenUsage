@@ -24,6 +24,7 @@ public struct UsageTreeRow: Identifiable, Sendable {
     public let ownUsage: TokenUsage
     public let subtreeUsage: TokenUsage
     public let counts: UsageCounts
+    public let imageGenerations: [ImageGenerationDetail]
     public let segments: [UsageSegment]
     public let modelSummary: String
     public let creditEstimate: CreditEstimate?
@@ -43,6 +44,7 @@ public struct UsageTreeRow: Identifiable, Sendable {
         ownUsage: TokenUsage,
         subtreeUsage: TokenUsage,
         counts: UsageCounts,
+        imageGenerations: [ImageGenerationDetail] = [],
         segments: [UsageSegment],
         modelSummary: String,
         creditEstimate: CreditEstimate?,
@@ -61,6 +63,7 @@ public struct UsageTreeRow: Identifiable, Sendable {
         self.ownUsage = ownUsage
         self.subtreeUsage = subtreeUsage
         self.counts = counts
+        self.imageGenerations = imageGenerations
         self.segments = segments
         self.modelSummary = modelSummary
         self.creditEstimate = creditEstimate

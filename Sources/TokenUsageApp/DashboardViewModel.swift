@@ -481,6 +481,7 @@ final class DashboardViewModel: ObservableObject {
             ownUsage: row.ownUsage,
             subtreeUsage: row.subtreeUsage,
             counts: row.counts,
+            imageGenerations: row.imageGenerations,
             segments: row.segments,
             modelSummary: row.modelSummary,
             creditEstimate: row.creditEstimate,

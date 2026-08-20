@@ -239,6 +239,67 @@ public struct UsageCounts: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+/// Optional, content-light metadata for one image-generation call. Every
+/// member is optional so report-v1 producers can add the fields they actually
+/// observe without making older or partial reports invalid.
+public struct ImageGenerationDetail: Codable, Equatable, Hashable, Sendable {
+    public let id: String?
+    public let threadId: String?
+    public let turnId: String?
+    public let generatedAt: Date?
+    public let status: String?
+    public let userPromptPreview: String?
+    public let userPromptTruncated: Bool?
+    public let revisedPromptPreview: String?
+    public let revisedPromptTruncated: Bool?
+    public let requestedSize: String?
+    public let reportedSize: String?
+    public let requestedQuality: String?
+    public let reportedQuality: String?
+    public let actualWidth: Int64?
+    public let actualHeight: Int64?
+    public let outputFormat: String?
+    public let outputBytes: Int64?
+
+    public init(
+        id: String? = nil,
+        threadId: String? = nil,
+        turnId: String? = nil,
+        generatedAt: Date? = nil,
+        status: String? = nil,
+        userPromptPreview: String? = nil,
+        userPromptTruncated: Bool? = nil,
+        revisedPromptPreview: String? = nil,
+        revisedPromptTruncated: Bool? = nil,
+        requestedSize: String? = nil,
+        reportedSize: String? = nil,
+        requestedQuality: String? = nil,
+        reportedQuality: String? = nil,
+        actualWidth: Int64? = nil,
+        actualHeight: Int64? = nil,
+        outputFormat: String? = nil,
+        outputBytes: Int64? = nil
+    ) {
+        self.id = id
+        self.threadId = threadId
+        self.turnId = turnId
+        self.generatedAt = generatedAt
+        self.status = status
+        self.userPromptPreview = userPromptPreview
+        self.userPromptTruncated = userPromptTruncated
+        self.revisedPromptPreview = revisedPromptPreview
+        self.revisedPromptTruncated = revisedPromptTruncated
+        self.requestedSize = requestedSize
+        self.reportedSize = reportedSize
+        self.requestedQuality = requestedQuality
+        self.reportedQuality = reportedQuality
+        self.actualWidth = actualWidth
+        self.actualHeight = actualHeight
+        self.outputFormat = outputFormat
+        self.outputBytes = outputBytes
+    }
+}
+
 public struct UsageSegment: Codable, Equatable, Hashable, Sendable {
     public let model: String?
     public let effort: String?
@@ -392,6 +453,9 @@ public struct UsageReport: Codable, Equatable, Identifiable, Sendable {
     /// no persisted state-database title. Readers remain source-agnostic.
     public let displayName: String?
     public let selectedTurnId: String?
+    /// Additive report-v1 metadata. `nil` means the producer predates image
+    /// details; counts remain authoritative in that case.
+    public let imageGenerations: [ImageGenerationDetail]?
     public let currentTurn: CurrentTurnSummary
     public let task: TaskSummary
     public let threads: [ThreadSummary]
@@ -400,6 +464,7 @@ public struct UsageReport: Codable, Equatable, Identifiable, Sendable {
     public let pricingCatalog: PricingCatalogReference
 
     public var id: String { rootThreadId }
+    public var imageGenerationDetails: [ImageGenerationDetail] { imageGenerations ?? [] }
 }
 
 public enum UsageReportDecoder {

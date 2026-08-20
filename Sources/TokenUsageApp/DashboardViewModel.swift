@@ -3,6 +3,12 @@ import Combine
 import Foundation
 import TokenUsageCore
 
+private struct LoadedUsageCandidate: Sendable {
+    let home: CodexHome
+    let report: UsageReport
+    let importedTitle: String?
+}
+
 @MainActor
 final class DashboardViewModel: ObservableObject {
     @Published private(set) var sessions: [UsageTreeRow] = []
@@ -24,12 +30,13 @@ final class DashboardViewModel: ObservableObject {
     @Published var selectedTrendSpeeds: Set<UsageTrendSpeed> = []
 
     private let repository = ReportRepository()
+    private let coworkImportRepository: CoWorkUsageImportRepository
     private let titleStore = ThreadTitleStore()
     private let historyGenerator = HistoricalReportGenerator()
     private let bookmarkStore: SecurityScopedBookmarkStore
     private let builder: UsageTreeBuilder
     private let trendAggregator: UsageTrendAggregator
-    private var monitors: [UUID: ReportDirectoryMonitor] = [:]
+    private var monitors: [String: ReportDirectoryMonitor] = [:]
     private var securityScopedURLs: [UUID: URL] = [:]
     private var loadGeneration = 0
 
@@ -47,6 +54,7 @@ final class DashboardViewModel: ObservableObject {
         self.bookmarkStore = bookmarkStore
         self.builder = UsageTreeBuilder(catalog: catalog)
         self.trendAggregator = UsageTrendAggregator(catalog: catalog)
+        self.coworkImportRepository = CoWorkUsageImportRepository(catalog: catalog)
         self.homes = homes
         self.selectedRoot = homes.first(where: \.isActive)?.rootURL
             ?? homes.first(where: \.isAvailable)?.rootURL
@@ -202,17 +210,31 @@ final class DashboardViewModel: ObservableObject {
     func reload(startMonitor: Bool = false) {
         loadGeneration += 1
         let generation = loadGeneration
-        let homes = self.homes
+        let registeredHomes = self.homes
+        let automaticHomes = automaticCoWorkHomes(excluding: registeredHomes)
+        let allSources = registeredHomes + automaticHomes
+        let automaticIDs = Set(automaticHomes.map(\.id))
         isLoading = true
         errorMessage = nil
 
         Task {
-            var winners: [String: (home: CodexHome, report: UsageReport)] = [:]
+            var winners: [String: LoadedUsageCandidate] = [:]
             var issues: [ReportLoadIssue] = []
             var successfulHomes = 0
             var duplicates = 0
 
-            for home in homes {
+            func consider(_ candidate: LoadedUsageCandidate) {
+                if let existing = winners[candidate.report.rootThreadId] {
+                    duplicates += 1
+                    if candidate.report.generatedAt > existing.report.generatedAt {
+                        winners[candidate.report.rootThreadId] = candidate
+                    }
+                } else {
+                    winners[candidate.report.rootThreadId] = candidate
+                }
+            }
+
+            for home in allSources {
                 guard home.isEnabled else { continue }
                 guard home.isAvailable else {
                     issues.append(
@@ -224,22 +246,45 @@ final class DashboardViewModel: ObservableObject {
                     )
                     continue
                 }
-                do {
-                    let result = try await repository.load(from: home.rootURL)
-                    successfulHomes += 1
-                    issues.append(contentsOf: result.issues.map { namespacedIssue($0, home: home) })
-                    for report in result.reports {
-                        if let existing = winners[report.rootThreadId] {
-                            duplicates += 1
-                            if report.generatedAt > existing.report.generatedAt {
-                                winners[report.rootThreadId] = (home, report)
-                            }
-                        } else {
-                            winners[report.rootThreadId] = (home, report)
+                var loadedSource = false
+                var ordinaryLoadError: Error?
+
+                if !automaticIDs.contains(home.id) {
+                    do {
+                        let result = try await repository.load(from: home.rootURL)
+                        loadedSource = true
+                        issues.append(contentsOf: result.issues.map { namespacedIssue($0, home: home) })
+                        for report in result.reports {
+                            consider(LoadedUsageCandidate(home: home, report: report, importedTitle: nil))
                         }
+                    } catch {
+                        ordinaryLoadError = error
+                    }
+                }
+
+                do {
+                    let imported = try await coworkImportRepository.load(from: home.rootURL)
+                    if imported.directoryExists { loadedSource = true }
+                    issues.append(contentsOf: imported.issues.map { namespacedIssue($0, home: home) })
+                    for item in imported.reports {
+                        consider(LoadedUsageCandidate(
+                            home: home,
+                            report: item.report,
+                            importedTitle: item.title
+                        ))
                     }
                 } catch {
-                    issues.append(homeIssue(home, suffix: "reports", message: error.localizedDescription))
+                    issues.append(homeIssue(home, suffix: "cowork-imports", message: error.localizedDescription))
+                }
+
+                if loadedSource {
+                    successfulHomes += 1
+                } else if let ordinaryLoadError, !automaticIDs.contains(home.id) {
+                    issues.append(homeIssue(
+                        home,
+                        suffix: "reports",
+                        message: ordinaryLoadError.localizedDescription
+                    ))
                 }
             }
 
@@ -248,13 +293,14 @@ final class DashboardViewModel: ObservableObject {
             for (homeID, candidates) in grouped {
                 guard let home = candidates.first?.home else { continue }
                 titlesByHome[homeID] = await titleStore.titles(
-                    for: Set(candidates.map { $0.report.rootThreadId }),
+                    for: Set(candidates.filter { $0.importedTitle == nil }.map { $0.report.rootThreadId }),
                     codexRoot: home.rootURL
                 )
             }
 
             let rows = winners.values.map { candidate in
-                let title = titlesByHome[candidate.home.id]?[candidate.report.rootThreadId]
+                let title = candidate.importedTitle
+                    ?? titlesByHome[candidate.home.id]?[candidate.report.rootThreadId]
                 return namespace(
                     builder.build(report: candidate.report, title: title),
                     homeID: candidate.home.id
@@ -269,7 +315,7 @@ final class DashboardViewModel: ObservableObject {
             isLoading = false
             lastUpdated = Date()
             if successfulHomes == 0 {
-                errorMessage = homes.contains(where: \.isEnabled)
+                errorMessage = registeredHomes.contains(where: \.isEnabled)
                     ? "没有可读取的 Codex Home；请检查目录授权或先同步报告。"
                     : "没有启用的 Codex Home。"
             } else {
@@ -323,25 +369,36 @@ final class DashboardViewModel: ObservableObject {
 
     private func installMonitors() {
         stopMonitors()
+        let sources = homes.filter(\.isActive) + automaticCoWorkHomes(excluding: homes)
+        var monitoredPaths = Set<String>()
+
+        func install(key: String, directory: URL, home: CodexHome) {
+            let path = directory.standardizedFileURL.path(percentEncoded: false)
+            guard monitoredPaths.insert(path).inserted else { return }
+            let monitor = ReportDirectoryMonitor()
+            do {
+                try monitor.start(directory: directory) { [weak self] in
+                    Task { @MainActor [weak self] in
+                        self?.reload(startMonitor: true)
+                    }
+                }
+                monitors[key] = monitor
+            } catch {
+                appendIssueIfNeeded(homeIssue(home, suffix: "monitor", message: error.localizedDescription))
+            }
+        }
+
         for home in homes where home.isActive {
             guard let directory = monitorDirectory(for: home) else {
                 appendIssueIfNeeded(homeIssue(home, suffix: "monitor", message: "目录不存在，无法监控"))
                 continue
             }
-            let monitor = ReportDirectoryMonitor()
-            do {
-                try monitor.start(directory: directory) { [weak self] in
-                    Task { @MainActor [weak self] in
-                        guard self?.homes.contains(where: { $0.id == home.id }) == true else { return }
-                        // Re-arm after every event as rename/delete/revoke closes
-                        // the underlying directory descriptor on some filesystems.
-                        self?.reload(startMonitor: true)
-                    }
-                }
-                monitors[home.id] = monitor
-            } catch {
-                appendIssueIfNeeded(homeIssue(home, suffix: "monitor", message: error.localizedDescription))
-            }
+            install(key: "reports:\(home.id.uuidString)", directory: directory, home: home)
+        }
+
+        for home in sources {
+            guard let directory = coworkMonitorDirectory(for: home) else { continue }
+            install(key: "cowork:\(home.id.uuidString)", directory: directory, home: home)
         }
     }
 
@@ -355,6 +412,65 @@ final class DashboardViewModel: ObservableObject {
             }
         }
         return nil
+    }
+
+    private func coworkMonitorDirectory(for home: CodexHome) -> URL? {
+        let imports = CoWorkUsageImportRepository.importsDirectory(for: home.rootURL)
+        let candidates = [
+            imports,
+            imports.deletingLastPathComponent(),
+            imports.deletingLastPathComponent().deletingLastPathComponent(),
+            home.rootURL.appendingPathComponent("token-usage", isDirectory: true),
+            home.rootURL
+        ]
+        for candidate in candidates {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    /// CoWork keeps its ephemeral App Server accounting in a dedicated Home.
+    /// Probe only that product-owned root; the importer itself opens only the
+    /// content-free token-usage/imports subtree.
+    private func automaticCoWorkHomes(excluding registered: [CodexHome]) -> [CodexHome] {
+        let userHome = FileManager.default.homeDirectoryForCurrentUser
+        let candidates: [(UUID, URL)] = [
+            (
+                UUID(uuidString: "00000000-0000-0000-0000-00000000c001")!,
+                userHome
+                    .appendingPathComponent("Library/Containers/com.marscmchen.CoWork.mac/Data/Library/Application Support/CoWork", isDirectory: true)
+                    .appendingPathComponent("CodexImageProvider", isDirectory: true)
+            ),
+            (
+                UUID(uuidString: "00000000-0000-0000-0000-00000000c002")!,
+                userHome
+                    .appendingPathComponent("Library/Application Support/CoWork", isDirectory: true)
+                    .appendingPathComponent("CodexImageProvider", isDirectory: true)
+            )
+        ]
+        let registeredPaths = Set(registered.map { codexHomePathKey($0.rootURL) })
+        var seenPaths = registeredPaths
+        return candidates.compactMap { id, candidate in
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { return nil }
+            let root = canonicalCodexRoot(candidate)
+            let key = codexHomePathKey(root)
+            guard seenPaths.insert(key).inserted else { return nil }
+            return CodexHome(
+                id: id,
+                name: "CoWork（脱敏用量）",
+                rootURL: root,
+                isDefault: false,
+                isEnabled: true,
+                authorizationError: nil,
+                bookmarkData: nil
+            )
+        }
     }
 
     private func stopMonitors() {

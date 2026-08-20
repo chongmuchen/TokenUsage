@@ -49,6 +49,24 @@ open ".build/app/Token Usage.app"
 - 解析器只提取计量所需白名单字段，不把 prompt、工具参数、工具输出或图片内容写入 App 报告。
 - App 不联网、不使用 MCP，也不把 `/status` 或任何提示注入会话，因此不会增加模型 token 或影响原任务上下文。
 
+### CoWork App Server 数据源
+
+TokenUsage 会自动探测 CoWork 的专用 Codex Home，并且只读取下面这个脱敏交换目录：
+
+```text
+~/Library/Containers/com.marscmchen.CoWork.mac/Data/Library/Application Support/CoWork/CodexImageProvider/token-usage/imports/cowork/v1
+```
+
+CoWork 继续使用 `ephemeral: true` 的 App Server 线程，不需要开启 Codex Hook，也不会为了统计而落盘 prompt、回复、图片、工具参数、认证信息或工作目录。每次运行只原子覆盖一个权限为 `0600` 的 JSON，用 `thread/tokenUsage/updated` 中的累计 `total` 计算增量，记录输入、缓存读、缓存写、输出、推理输出、模型、推理强度和速度档位。TokenUsage 会把这些记录转换为普通的会话树和分钟样本，因此可参与会话表、日期/Token 条件、模型/强度/速度筛选、每日曲线与汇总。
+
+- 只统计升级后的 CoWork 运行。旧 SwiftData 记录只保存最后一次响应的 `last`，缺少累计量、缓存写和实际 Codex 配置，无法无损回填，因而不会伪装成完整历史。
+- 运行中、失败或中断的记录按“已观测下界”显示；累计计数回退、字段关系错误或无法对账时拒绝导入或抑制价格。
+- 这里统计的是驱动 CoWork 工作流的 Codex 控制回合。图片生成模型自身的 token、图片尺寸/质量价格和其他工具按次费用不包含在内。
+- CoWork 能取得后端 credits 估计时，会话 Credits 优先显示该值；趋势中的分钟价格与 API USD 仍是 TokenUsage 静态公开价目下的等价估算，并非实际订阅或 API 账单。
+- 当前非沙箱构建可自动读取上述目录；如果以后启用 App Sandbox，需要在“Codex Home”菜单中显式授权该目录，或为两个 App 配置共享容器。
+
+App Server 的事件边界可参考 [Codex App Server 文档](https://learn.chatgpt.com/docs/app-server)。
+
 只接受 report schema v1。无效、超大、符号链接、文件名/root ID 不一致或未知版本的报告会被隔离成读取警告，其余有效报告仍可显示。
 
 Codex 官方说明 Hook transcript 的格式不是稳定公共接口，因此将来 Codex 升级后若内部字段变化，解析结果可能降级为下界或需要同步更新读取器；参考 [Codex Hooks 文档](https://learn.chatgpt.com/docs/hooks)。
@@ -109,5 +127,6 @@ Codex 官方说明 Hook transcript 的格式不是稳定公共接口，因此将
 - 合并/按配置曲线、模型/推理强度/速度过滤；
 - 缓存与非缓存 Token 拆分、Credits/API 价格和部分定价覆盖率；
 - Fork 分支分钟样本去除继承前缀，以及迁移 Codex Home 后不跟随旧绝对 transcript 路径。
+- CoWork 累计 `total` 的幂等增量、缓存写、配置/价格、运行中下界、符号链接与畸形交换文件隔离。
 
 测试源码不包含真实会话 ID、真实路径或真实对话正文。

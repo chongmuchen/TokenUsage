@@ -94,10 +94,9 @@ public struct UsageFilter: Equatable, Sendable {
     public var preset: DatePreset
 
     public init(now: Date = Date(), calendar: Calendar = .current) {
-        let end = Self.startOfMinute(now, calendar: calendar)
-        let startOfToday = calendar.startOfDay(for: end)
+        let startOfToday = calendar.startOfDay(for: now)
         self.startDate = calendar.date(byAdding: .day, value: -29, to: startOfToday) ?? startOfToday
-        self.endDate = end
+        self.endDate = Self.endMinuteOfDay(containing: now, calendar: calendar)
         self.minimumTokensText = ""
         self.maximumTokensText = ""
         self.preset = .month
@@ -145,9 +144,8 @@ public struct UsageFilter: Equatable, Sendable {
     public mutating func apply(_ preset: DatePreset, now: Date = Date(), calendar: Calendar = .current) {
         self.preset = preset
         guard preset != .custom else { return }
-        let end = Self.startOfMinute(now, calendar: calendar)
-        let startOfToday = calendar.startOfDay(for: end)
-        endDate = end
+        let startOfToday = calendar.startOfDay(for: now)
+        endDate = Self.endMinuteOfDay(containing: now, calendar: calendar)
         switch preset {
         case .today:
             startDate = startOfToday
@@ -182,5 +180,16 @@ public struct UsageFilter: Equatable, Sendable {
     private static func startOfMinute(_ date: Date, calendar: Calendar) -> Date {
         let components = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
         return calendar.date(from: components) ?? date
+    }
+
+    private static func endMinuteOfDay(containing date: Date, calendar: Calendar) -> Date {
+        let startOfDay = calendar.startOfDay(for: date)
+        guard
+            let startOfNextDay = calendar.date(byAdding: .day, value: 1, to: startOfDay),
+            let endMinute = calendar.date(byAdding: .minute, value: -1, to: startOfNextDay)
+        else {
+            return startOfMinute(date, calendar: calendar)
+        }
+        return endMinute
     }
 }

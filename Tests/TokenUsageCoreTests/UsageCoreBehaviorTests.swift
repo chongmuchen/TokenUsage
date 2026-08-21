@@ -77,25 +77,28 @@ func unsupportedSchemaIsRejected() throws {
     }
 }
 
-@Test("Default and quick date ranges contain 30, 7, and 1 calendar days")
+@Test("Default and quick date ranges end at 23:59 and contain 30, 7, and 1 calendar days")
 func datePresetRanges() throws {
     let calendar = utcCalendar()
     let now = try #require(calendar.date(from: DateComponents(
         year: 2026, month: 3, day: 15, hour: 18, minute: 45
     )))
+    let endOfToday = try #require(calendar.date(from: DateComponents(
+        year: 2026, month: 3, day: 15, hour: 23, minute: 59
+    )))
 
     var filter = UsageFilter(now: now, calendar: calendar)
     #expect(filter.preset == .month)
     #expect(filter.startDate == date(2026, 2, 14, calendar: calendar))
-    #expect(filter.endDate == now)
+    #expect(filter.endDate == endOfToday)
 
     filter.apply(.week, now: now, calendar: calendar)
     #expect(filter.startDate == date(2026, 3, 9, calendar: calendar))
-    #expect(filter.endDate == now)
+    #expect(filter.endDate == endOfToday)
 
     filter.apply(.today, now: now, calendar: calendar)
     #expect(filter.startDate == date(2026, 3, 15, calendar: calendar))
-    #expect(filter.endDate == now)
+    #expect(filter.endDate == endOfToday)
 
     let customStart = date(2026, 1, 2, calendar: calendar)
     let customEnd = date(2026, 1, 4, calendar: calendar)

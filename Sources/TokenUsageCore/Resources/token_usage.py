@@ -32,7 +32,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 
-CACHE_SCHEMA_VERSION = 10
+CACHE_SCHEMA_VERSION = 11
 CHECKPOINT_BYTES = 4096
 REPORT_SCHEMA_VERSION = 1
 PROMPT_PREVIEW_CHARACTERS = 240
@@ -200,10 +200,10 @@ def _counts_difference(current: Dict[str, int], baseline: Dict[str, int]) -> Tup
 def _usage_delta(current: Dict[str, int], previous: Dict[str, int]) -> Tuple[Dict[str, int], bool, bool]:
     reset = any(current[field] < previous[field] for field in USAGE_FIELDS)
     if reset:
-        # The observed Codex counters are cumulative and monotonic. A lower
-        # sample may be stale or may indicate an undocumented reset; counting
-        # it as a new segment can massively double-count. Preserve the last
-        # known lower bound and suppress pricing instead.
+        # The observed Codex counters are cumulative and monotonic within a
+        # task epoch. The caller handles an explicit task-boundary rebase; any
+        # other lower sample may be stale, and counting it as a new segment can
+        # massively double-count. Preserve the last known lower bound instead.
         return _zero_usage(), True, False
     else:
         delta = {field: current[field] - previous[field] for field in USAGE_FIELDS}
@@ -452,6 +452,7 @@ def _new_parser_state(transcript_path: Path, stat_result: os.stat_result) -> Dic
         "active_turn_id": None,
         "settings": {"model": None, "effort": None, "tier": None},
         "last_total_usage": _zero_usage(),
+        "last_total_usage_task_epoch": 0,
         "raw_usage": _zero_usage(),
         "raw_counts": _zero_counts(),
         "seen_call_hashes": {},
@@ -824,11 +825,24 @@ def _process_record(state: Dict[str, Any], record: Dict[str, Any]) -> None:
             _append_warning(state, "cached_input_tokens plus cache_write_input_tokens exceeded input_tokens")
         if current["reasoning_output_tokens"] > current["output_tokens"]:
             _append_warning(state, "reasoning_output_tokens exceeded output_tokens")
-        delta, reset, mismatch = _usage_delta(current, _usage_from(state.get("last_total_usage")))
+        previous = _usage_from(state.get("last_total_usage"))
+        sample_task_epoch = _as_int(state.get("task_epoch"))
+        first_sample_in_task_epoch = (
+            _as_int(state.get("last_total_usage_task_epoch")) != sample_task_epoch
+        )
+        delta, reset, mismatch = _usage_delta(current, previous)
+        if reset and first_sample_in_task_epoch:
+            # Codex may restart its cumulative counters when a new task begins.
+            # The first sample in that task is then the complete epoch-local
+            # usage, not a stale/decreasing sample. Rebase only at this
+            # explicit task boundary; a later decrease in the same task still
+            # fails the monotonicity invariant below.
+            delta, reset, mismatch = _usage_delta(current, _zero_usage())
         if reset:
             _append_warning(state, "token counters decreased; usage is a lower bound and price estimates were suppressed")
             return
         state["last_total_usage"] = current
+        state["last_total_usage_task_epoch"] = sample_task_epoch
         if mismatch:
             _append_warning(state, "a token delta had total_tokens != input_tokens + output_tokens")
         if not delta["total_tokens"]:

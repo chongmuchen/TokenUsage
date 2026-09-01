@@ -312,7 +312,7 @@ private struct TrendPriceAccumulator: Sendable {
     mutating func add(_ estimate: CreditEstimate) {
         add(
             amount: estimate.amount,
-            basis: estimate.basis == .configured ? .configured : .standard,
+            basis: trendBasis(for: estimate.basis),
             pricedTokens: estimate.pricedTokens,
             totalTokens: estimate.totalTokens
         )
@@ -321,7 +321,7 @@ private struct TrendPriceAccumulator: Sendable {
     mutating func add(_ estimate: APIPriceEstimate) {
         add(
             amount: estimate.amount,
-            basis: estimate.basis == .configured ? .configured : .standard,
+            basis: trendBasis(for: estimate.basis),
             pricedTokens: estimate.pricedTokens,
             totalTokens: estimate.totalTokens
         )
@@ -360,6 +360,22 @@ private struct TrendPriceAccumulator: Sendable {
         amount += value
         hasAmount = true
         bases.insert(basis)
+    }
+
+    private func trendBasis(for basis: CreditEstimateBasis) -> UsageTrendPriceBasis {
+        switch basis {
+        case .configured: .configured
+        case .standard: .standard
+        case .mixed: .mixed
+        }
+    }
+
+    private func trendBasis(for basis: APIPriceEstimateBasis) -> UsageTrendPriceBasis {
+        switch basis {
+        case .configured: .configured
+        case .standard: .standard
+        case .mixed: .mixed
+        }
     }
 }
 

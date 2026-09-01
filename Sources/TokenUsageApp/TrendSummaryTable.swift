@@ -151,10 +151,29 @@ struct TrendSummaryTable: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
-        .help(
-            "Credits 已定价 \(TokenFormatter.exact(credits.pricedTokens)) / \(TokenFormatter.exact(credits.totalTokens)) tokens；"
-                + "API 已定价 \(TokenFormatter.exact(apiUSD.pricedTokens)) / \(TokenFormatter.exact(apiUSD.totalTokens)) tokens"
-        )
+        .help(coverageHelp(credits: credits, apiUSD: apiUSD))
+    }
+
+    private func coverageHelp(
+        credits: UsageTrendPriceSummary,
+        apiUSD: UsageTrendPriceSummary
+    ) -> String {
+        [
+            coverageHelpLine("Credits", summary: credits),
+            coverageHelpLine("API", summary: apiUSD),
+            "计数校验抑价表示为了避免用不可靠的 token 差值算钱而主动隐藏价格；价目未覆盖表示缺少对应模型的公开价格。"
+        ].joined(separator: "\n")
+    }
+
+    private func coverageHelpLine(
+        _ label: String,
+        summary: UsageTrendPriceSummary
+    ) -> String {
+        let catalogUnpriced = max(summary.unpricedTokens - summary.suppressedTokens, 0)
+        return "\(label)：已定价 \(TokenFormatter.exact(summary.pricedTokens)) / "
+            + "\(TokenFormatter.exact(summary.totalTokens))；计数校验抑价 "
+            + "\(TokenFormatter.exact(summary.suppressedTokens))；价目未覆盖 "
+            + "\(TokenFormatter.exact(catalogUnpriced)) tokens"
     }
 
     private func summaryHelp(_ series: UsageTrendSeries) -> String {

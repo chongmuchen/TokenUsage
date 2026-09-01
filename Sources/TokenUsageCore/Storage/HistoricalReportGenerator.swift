@@ -56,13 +56,15 @@ public enum HistoricalSyncError: LocalizedError {
     }
 }
 
-/// Runs the bundled, model-free parser for user tasks that do not yet have a
-/// report. It never invokes Codex or an OpenAI endpoint.
+/// Runs the bundled, model-free parser for user tasks whose report is missing
+/// or no longer safe to reuse. It never invokes Codex or an OpenAI endpoint.
 public actor HistoricalReportGenerator {
     private let parserTimeout: TimeInterval
+    private let currentCatalogID: String?
 
-    public init(parserTimeout: TimeInterval = 45) {
+    public init(parserTimeout: TimeInterval = 45, currentCatalogID: String? = nil) {
         self.parserTimeout = min(max(parserTimeout, 0.1), 300)
+        self.currentCatalogID = currentCatalogID ?? (try? PricingCatalog.bundled())?.catalogId
     }
 
     public func generateMissingReports(
@@ -91,7 +93,7 @@ public actor HistoricalReportGenerator {
         for (index, sessionID) in sessionIDs.enumerated() {
             try Task.checkCancellation()
             let reportURL = reportsDirectory.appendingPathComponent(sessionID).appendingPathExtension("json")
-            if validExistingReport(at: reportURL, expectedRootID: sessionID) {
+            if reusableExistingReport(at: reportURL, expectedRootID: sessionID) {
                 skipped += 1
             } else if try await runParser(script: script, codexRoot: codexRoot, sessionID: sessionID) {
                 generated += 1
@@ -193,7 +195,7 @@ public actor HistoricalReportGenerator {
         return String(format: "%020d-%020.0f", version, modified)
     }
 
-    private func validExistingReport(at url: URL, expectedRootID: String) -> Bool {
+    private func reusableExistingReport(at url: URL, expectedRootID: String) -> Bool {
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
         guard
             let values = try? url.resourceValues(forKeys: keys),
@@ -203,11 +205,32 @@ public actor HistoricalReportGenerator {
             fileSize > 0,
             Int64(fileSize) <= ReportRepository.maximumReportBytes,
             let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
-            let report = try? UsageReportDecoder.decode(data),
-            report.rootThreadId == expectedRootID,
-            report.task.usageSamples != nil
+            let report = try? UsageReportDecoder.decode(data)
         else { return false }
-        return true
+        return !Self.needsRefresh(
+            report: report,
+            expectedRootID: expectedRootID,
+            currentCatalogID: currentCatalogID
+        )
+    }
+
+    /// A report is rebuilt when a newer parser can turn an observed lower
+    /// bound or a suppressed estimate into a complete result, or when bundled
+    /// public prices changed. Kept internal so the policy can be regression
+    /// tested without touching a user's Codex Home.
+    static func needsRefresh(
+        report: UsageReport,
+        expectedRootID: String,
+        currentCatalogID: String?
+    ) -> Bool {
+        guard report.rootThreadId == expectedRootID else { return true }
+        guard report.task.usageSamples != nil else { return true }
+        guard !report.task.usageIsLowerBound else { return true }
+        guard report.task.cost.costSuppressed != true else { return true }
+
+        guard let currentCatalogID else { return false }
+        return report.pricingCatalog.catalogId != currentCatalogID
+            || report.task.cost.catalogId != currentCatalogID
     }
 
     private func runParser(script: URL, codexRoot: URL, sessionID: String) async throws -> Bool {

@@ -45,7 +45,7 @@ open ".build/app/Token Usage.app"
 默认数据目录是 `~/.codex`。工具栏的 Codex Home 菜单可以启停任意目录、继续添加其他目录，或移除非默认目录；选择结果用 security-scoped bookmark 保存。跨目录遇到相同 `root_thread_id` 时，只采用生成时间最新的报告，避免复制或迁移目录后重复计数。
 
 - 普通刷新只读 `token-usage/reports/*.json`，并只读 `state_*.sqlite` 的 `first_user_message` 来生成短标题。
-- “同步当前日期范围”会运行随 App 打包的本地解析器，为日期范围内尚无报告的用户会话生成 per-session JSON/TXT。它不会调用 Codex 模型或 OpenAI API，也不会覆盖实时的 `latest.json/latest.txt`。
+- “同步当前日期范围”会运行随 App 打包的本地解析器：为缺失报告的用户会话生成 per-session JSON/TXT，并重建仍是下界、曾因计数校验而抑制价格、或使用旧价目快照的已有报告；内容完整且使用当前价目的报告会跳过。它不会调用 Codex 模型或 OpenAI API，也不会覆盖实时的 `latest.json/latest.txt`。
 - 解析器只提取计量所需白名单字段。图片生成可额外记录用户输入提示词和模型 `revised_prompt` 的空白归一化预览（各最多 240 个字符及截断标记），以及尺寸、质量、格式、像素和字节数等标量；不会写入完整 prompt、普通工具参数/输出、图片内容或图片路径。
 - App 不联网、不使用 MCP，也不把 `/status` 或任何提示注入会话，因此不会增加模型 token 或影响原任务上下文。
 
@@ -85,6 +85,8 @@ Codex 官方说明 Hook transcript 的格式不是稳定公共接口，因此将
 
 分钟趋势使用报告中的 `task.usage_samples` 作为唯一计量平面：解析器把每次正 token 增量按 UTC 分钟和配置组合归档，App 再按本机日历汇成每日点。它不会把 `task`、thread 和 turn 三套重复视图相加，也不会把跨分钟或跨午夜的段按持续时间平均摊分。旧报告没有分钟样本时仍可显示，但会按 segment 的最后用量时间近似归档并明确警告；点击“同步当前日期范围”可用新解析器重建这些历史报告。
 
+同一会话可以经历多个 `task_started` epoch。新 epoch 的累计 token counter 可以从较小值重新开始；解析器会在 epoch 边界重置比较基线，并把新 epoch 的首个样本计入累计量，不再把这种正常重置误判为计数回退。只有同一 epoch 内的真实回退才会触发完整性警告并抑制价格。
+
 ## 展开结构与计量规则
 
 ```text
@@ -111,8 +113,10 @@ Codex 官方说明 Hook transcript 的格式不是稳定公共接口，因此将
 
 - `Credits` 是 Codex credits 公开费率估算；配置档位无法确认时会明确退回 Standard 等价或部分价。
 - `API USD 等价` 是相同 token 按默认公共 API token 价的等价估算，不是 ChatGPT/Codex 订阅的实际美元扣款，也不包含区域加价、工具调用、图片生成等额外费用。
+- `Credits` 与 `API USD 等价` 是对同一用量采用两套公开价目分别计算的替代视图，不是同一账单的两个组成部分，不能相加。
 - 配置档位来自本地会话记录，不等于服务端确认的实际执行档位；服务端可能降级，因此所有金额均以 `≈` 标记。
-- 缓存读/写、reasoning 的包含关系不会二次计价；缺公开价的模型只显示已定价部分或 `—`。
+- 趋势和会话明细使用同一套逐 segment 档位逻辑：有可靠证据的 Fast segment 按 Fast 估算；`current_config_fallback` 或未知档位按 Standard 回退；不会先把混合档位的整个会话压成一个档位。
+- 缓存读/写、reasoning 的包含关系不会二次计价；未知模型只影响其自身 segment，其他已知模型仍参与估算，并以覆盖率标明部分定价；完全没有公开价时显示 `—`。
 - 图片输入 token 已折入 input，但 report v1 无法从总 input 中单独拆出；图片生成详情中的尺寸/质量仅供查看，Web/File Search、图片生成、容器、存储和外部 MCP 的按次费用仍无法完整还原。
 
 ## 测试
@@ -124,10 +128,11 @@ Codex 官方说明 Hook transcript 的格式不是稳定公共接口，因此将
 - `100k` / `1.5M` 和包含边界的 Token 过滤；
 - direct、time-inferred、side/unattributed 归属和循环/重复保护；
 - 会话、轮次、线程、子代理的汇总不重复计数；
-- 历史回填不改写 `latest`；
+- 历史同步会生成缺失报告，并重建下界、抑价和旧价目报告，同时不改写 `latest`；
 - 分钟结束边界、跨本地午夜的每日分桶和缺失日期补零；
 - 合并/按配置曲线、模型/推理强度/速度过滤；
-- 缓存与非缓存 Token 拆分、Credits/API 价格和部分定价覆盖率；
+- 跨 `task_started` epoch 的累计计数重置，以及同一 epoch 内真实回退的完整性保护；
+- 缓存与非缓存 Token 拆分、逐 segment 一致的 Credits/API 价格和未知模型的部分定价覆盖率；
 - Fork 分支分钟样本去除继承前缀，以及迁移 Codex Home 后不跟随旧绝对 transcript 路径。
 - 标准 report 的可选显示名与缺失内嵌价格时的通用价目回退；CoWork 生产端另行覆盖累计增量、原子落盘和旧格式迁移。
 

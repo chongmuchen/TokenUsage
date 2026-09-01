@@ -295,10 +295,10 @@ func creditsAndAPIPricesAreBothEstimated() throws {
     )
     let credits = estimator.estimate([standard])
     let api = estimator.estimateAPI([standard])
-    #expect(credits.amount == Decimal(string: "177.5"))
+    #expect(credits.amount == Decimal(string: "132"))
     // The segment records per-request long-context status. Its aggregate may
     // exceed 272k because it contains many short requests and must stay short.
-    #expect(api.amount == Decimal(string: "7.225"))
+    #expect(api.amount == Decimal(string: "5.38"))
     #expect(api.basis == .configured)
 
     let fast = UsageSegment(
@@ -313,8 +313,8 @@ func creditsAndAPIPricesAreBothEstimated() throws {
         lastAt: nil,
         requestCount: 1
     )
-    #expect(estimator.estimate([fast]).amount == Decimal(string: "443.75"))
-    #expect(estimator.estimateAPI([fast]).amount == Decimal(string: "14.45"))
+    #expect(estimator.estimate([fast]).amount == Decimal(string: "330"))
+    #expect(estimator.estimateAPI([fast]).amount == Decimal(string: "10.76"))
 
     let long = UsageSegment(
         model: "gpt-5.6-sol",
@@ -328,7 +328,7 @@ func creditsAndAPIPricesAreBothEstimated() throws {
         lastAt: nil,
         requestCount: 1
     )
-    #expect(estimator.estimateAPI([long]).amount == Decimal(string: "12.95"))
+    #expect(estimator.estimateAPI([long]).amount == Decimal(string: "9.76"))
 
     let unknownContext = UsageSegment(
         model: "gpt-5.6-sol",
@@ -394,6 +394,46 @@ func sessionPriceSafetyRules() throws {
     #expect(session.creditEstimate?.amount == Decimal(string: "2.50"))
     #expect(session.apiPriceEstimate?.basis == .standard)
     #expect(session.apiPriceEstimate?.amount == Decimal(string: "0.20"))
+}
+
+@Test("Historical sync rebuilds lower-bound, suppressed, legacy, and stale-price reports")
+func historicalSyncRefreshPolicy() throws {
+    let current = try historicalPolicyReport()
+    #expect(!HistoricalReportGenerator.needsRefresh(
+        report: current,
+        expectedRootID: "session-root",
+        currentCatalogID: "current-catalog"
+    ))
+    #expect(HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(hasUsageSamples: false),
+        expectedRootID: "session-root",
+        currentCatalogID: "current-catalog"
+    ))
+    #expect(HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(isLowerBound: true),
+        expectedRootID: "session-root",
+        currentCatalogID: "current-catalog"
+    ))
+    #expect(HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(costSuppressed: true),
+        expectedRootID: "session-root",
+        currentCatalogID: "current-catalog"
+    ))
+    #expect(HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(reportCatalogID: "old-catalog"),
+        expectedRootID: "session-root",
+        currentCatalogID: "current-catalog"
+    ))
+    #expect(HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(costCatalogID: "old-catalog"),
+        expectedRootID: "session-root",
+        currentCatalogID: "current-catalog"
+    ))
+    #expect(HistoricalReportGenerator.needsRefresh(
+        report: current,
+        expectedRootID: "another-session",
+        currentCatalogID: "current-catalog"
+    ))
 }
 
 @Test("Filtered summary counts only sessions and preserves displayed price coverage")
@@ -571,6 +611,38 @@ private func makeSyntheticReportData(
         ]
     ]
     return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+}
+
+private func historicalPolicyReport(
+    hasUsageSamples: Bool = true,
+    isLowerBound: Bool = false,
+    costSuppressed: Bool = false,
+    reportCatalogID: String = "current-catalog",
+    costCatalogID: String = "current-catalog"
+) throws -> UsageReport {
+    var object = try #require(
+        JSONSerialization.jsonObject(with: makeSyntheticReportData()) as? [String: Any]
+    )
+    var task = try #require(object["task"] as? [String: Any])
+    if hasUsageSamples {
+        task["usage_samples"] = []
+    } else {
+        task.removeValue(forKey: "usage_samples")
+    }
+    task["usage_is_lower_bound"] = isLowerBound
+    task["cost"] = [
+        "catalog_id": costCatalogID,
+        "cost_suppressed": costSuppressed
+    ]
+    object["task"] = task
+    object["pricing_catalog"] = [
+        "catalog_id": reportCatalogID,
+        "observed_at": "2026-09-01",
+        "scope": "tests"
+    ]
+    return try UsageReportDecoder.decode(
+        JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    )
 }
 
 private func usage(

@@ -180,10 +180,10 @@ func trendPriceAndCoverage() throws {
     )
     let summary = try #require(result.series.first?.summary)
 
-    #expect(summary.credits.amount == Decimal(string: "177.5"))
+    #expect(summary.credits.amount == Decimal(string: "132"))
     #expect(summary.credits.basis == .configured)
     #expect(summary.credits.pricedTokens == 1_100_000)
-    #expect(summary.apiUSD.amount == Decimal(string: "7.225"))
+    #expect(summary.apiUSD.amount == Decimal(string: "5.38"))
     #expect(summary.apiUSD.basis == .configured)
     #expect(summary.apiUSD.isPartial == false)
 }

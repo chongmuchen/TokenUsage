@@ -30,6 +30,9 @@ public struct UsageTreeBuilder: Sendable {
         var warnings: [String] = []
         if credit?.basis == .mixed { warnings.append("Credits 汇总包含配置价和 Standard 价两种估算口径。") }
         if apiPrice?.basis == .mixed { warnings.append("API USD 汇总包含配置档和 Standard 两种估算口径。") }
+        if topLevel.contains(where: { containsPricingSuppressionReason($0.warnings) }) {
+            warnings.append("部分会话的 Token 计数校验未通过；price estimates were suppressed（价格估算已隐藏）。")
+        }
 
         return UsageTreeRow(
             id: "summary:filtered",
@@ -323,26 +326,46 @@ public struct UsageTreeBuilder: Sendable {
             )
         }
 
-        var sessionWarnings = report.warnings + attributionWarnings
+        var sessionWarnings = report.warnings + attributionWarnings + (report.task.cost.warnings ?? [])
+        if pricingSuppressed, !containsPricingSuppressionReason(sessionWarnings) {
+            // `cost_suppressed` is authoritative even if an older producer did
+            // not include its human-readable reason. Keep a canonical marker
+            // so unavailable-price tooltips can distinguish validation
+            // suppression from a catalog coverage gap.
+            sessionWarnings.append("token counter invariants failed; price estimates were suppressed")
+        }
         let threadTotal = TokenUsage.sum(report.threads.map(\.usage))
         if threadTotal != report.task.usage {
             sessionWarnings.append("任务汇总与线程独占用量之和不一致；表格以任务汇总为准。")
         }
         let sessionStart = root.flatMap { orderedTurns($0).compactMap(\.effectiveStart).min() } ?? report.generatedAt
+        let pricingSegments = sessionPricingSegments(for: report.task)
+        let estimatedCredit = estimator.estimate(
+            pricingSegments,
+            expectedTotalTokens: report.task.usage.totalTokens
+        )
+        let estimatedAPIPrice = estimator.estimateAPI(
+            pricingSegments,
+            expectedTotalTokens: report.task.usage.totalTokens
+        )
         let sessionCredit = pricingSuppressed
             ? nil
-            : sessionCreditEstimate(report.task.cost, totalTokens: report.task.usage.totalTokens)
-                ?? estimator.estimate(
-                    report.task.segments,
-                    expectedTotalTokens: report.task.usage.totalTokens
+            : estimateWithLegacyFallback(
+                estimatedCredit,
+                fallback: sessionCreditEstimate(
+                    report.task.cost,
+                    totalTokens: report.task.usage.totalTokens
                 )
+            )
         let sessionAPIPrice = pricingSuppressed
             ? nil
-            : sessionAPIPriceEstimate(report.task.cost, totalTokens: report.task.usage.totalTokens)
-                ?? estimator.estimateAPI(
-                    report.task.segments,
-                    expectedTotalTokens: report.task.usage.totalTokens
+            : estimateWithLegacyFallback(
+                estimatedAPIPrice,
+                fallback: sessionAPIPriceEstimate(
+                    report.task.cost,
+                    totalTokens: report.task.usage.totalTokens
                 )
+            )
 
         return UsageTreeRow(
             id: "session:\(report.rootThreadId)",
@@ -362,7 +385,7 @@ public struct UsageTreeBuilder: Sendable {
             apiUSDText: report.task.cost.preferredAPIUSDText,
             attribution: .direct,
             isLowerBound: report.task.usageIsLowerBound,
-            warnings: sessionWarnings + (report.task.cost.warnings ?? []),
+            warnings: sessionWarnings,
             children: rootTurnRows
         )
     }
@@ -457,6 +480,53 @@ public struct UsageTreeBuilder: Sendable {
 
     private func shortID(_ value: String) -> String {
         String(value.prefix(8))
+    }
+
+    private func containsPricingSuppressionReason(_ warnings: [String]) -> Bool {
+        warnings.contains { warning in
+            let normalized = warning.lowercased()
+            return normalized.contains("price estimates were suppressed")
+                || normalized.contains("token counter invariants failed")
+        }
+    }
+
+    /// New reports expose the same minute accounting plane used by the trend
+    /// view. Pricing the session from those buckets makes tier selection and
+    /// partial coverage additive and directly comparable across both views.
+    private func sessionPricingSegments(for task: TaskSummary) -> [UsageSegment] {
+        guard let samples = task.usageSamples else { return task.segments }
+        return samples.map { sample in
+            UsageSegment(
+                model: sample.model,
+                effort: sample.effort,
+                tier: sample.tier,
+                tierSource: sample.tierSource,
+                taskEpoch: sample.taskEpoch,
+                longContext: sample.longContext,
+                usage: sample.usage,
+                firstAt: sample.minute,
+                lastAt: sample.minute,
+                requestCount: sample.requestCount
+            )
+        }
+    }
+
+    /// Embedded report prices remain a compatibility fallback for legacy
+    /// reports whose model cannot be priced by the reader's catalog. As soon as
+    /// any current-catalog subtotal is available, keep that internally
+    /// consistent partial result instead of replacing it with an older basis.
+    private func estimateWithLegacyFallback(
+        _ estimate: CreditEstimate,
+        fallback: @autoclosure () -> CreditEstimate?
+    ) -> CreditEstimate? {
+        estimate.amount == nil ? fallback() : estimate
+    }
+
+    private func estimateWithLegacyFallback(
+        _ estimate: APIPriceEstimate,
+        fallback: @autoclosure () -> APIPriceEstimate?
+    ) -> APIPriceEstimate? {
+        estimate.amount == nil ? fallback() : estimate
     }
 
     private func sessionCreditEstimate(_ cost: CostSummary, totalTokens: Int64) -> CreditEstimate? {

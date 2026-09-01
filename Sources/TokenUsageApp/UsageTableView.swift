@@ -69,13 +69,13 @@ struct UsageTableView: View {
             .customizationID("model")
 
             TableColumn("Credits") { row in
-                CreditsCell(estimate: row.creditEstimate)
+                CreditsCell(estimate: row.creditEstimate, warnings: row.warnings)
             }
             .width(min: 120, ideal: 140, max: 175)
             .customizationID("credits")
 
             TableColumn("API USD 等价") { row in
-                APIPriceCell(estimate: row.apiPriceEstimate)
+                APIPriceCell(estimate: row.apiPriceEstimate, warnings: row.warnings)
             }
             .width(min: 130, ideal: 150, max: 185)
             .customizationID("api-price")
@@ -456,6 +456,7 @@ private struct CacheCell: View {
 
 private struct CreditsCell: View {
     let estimate: CreditEstimate?
+    let warnings: [String]
 
     var body: some View {
         if let estimate, let amount = estimate.amount {
@@ -475,7 +476,7 @@ private struct CreditsCell: View {
             Text("—")
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .trailing)
-                .help("没有足够的公开价目来估算")
+                .help(unavailablePriceHelp(warnings: warnings, currency: "Credits"))
         }
     }
 
@@ -502,6 +503,7 @@ private struct CreditsCell: View {
 
 private struct APIPriceCell: View {
     let estimate: APIPriceEstimate?
+    let warnings: [String]
 
     var body: some View {
         if let estimate, let amount = estimate.amount {
@@ -519,7 +521,7 @@ private struct APIPriceCell: View {
             Text("—")
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .trailing)
-                .help("没有足够的公开 API 价目来估算")
+                .help(unavailablePriceHelp(warnings: warnings, currency: "API USD"))
         }
     }
 
@@ -546,6 +548,18 @@ private struct APIPriceCell: View {
         case (false, false): "≈"
         }
     }
+}
+
+private func unavailablePriceHelp(warnings: [String], currency: String) -> String {
+    let suppressed = warnings.contains { warning in
+        let normalized = warning.lowercased()
+        return normalized.contains("price estimates were suppressed")
+            || normalized.contains("token counter invariants failed")
+    }
+    if suppressed {
+        return "Token 计数校验未通过，应用已主动隐藏 \(currency) 估算；这不是缺少公开价目。重新同步该日期范围可用新版解析器重建报告。"
+    }
+    return "该行没有足够的公开价目来估算 \(currency)；可能是模型未知或公开价目未覆盖。"
 }
 
 enum TokenFormatter {

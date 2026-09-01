@@ -137,10 +137,10 @@ public struct CreditEstimator: Sendable {
         _ segments: [UsageSegment],
         expectedTotalTokens: Int64? = nil
     ) -> CreditEstimate {
-        var standardAmount = Decimal.zero
-        var configuredAmount = Decimal.zero
-        var standardTokens: Int64 = 0
-        var configuredTokens: Int64 = 0
+        var estimatedAmount = Decimal.zero
+        var hasAmount = false
+        var bases = Set<CreditEstimateBasis>()
+        var pricedTokens: Int64 = 0
         let segmentTokens = segments.reduce(Int64.zero) {
             addingWithoutOverflow($0, $1.usage.totalTokens)
         }
@@ -168,33 +168,27 @@ public struct CreditEstimator: Sendable {
                 + Decimal(usage.outputTokens) * outputRate
             ) / unit
 
-            standardAmount += base
-            standardTokens = addingWithoutOverflow(standardTokens, usage.totalTokens)
+            let selected: (amount: Decimal, basis: CreditEstimateBasis)
+            switch pricingTier(for: segment) {
+            case .standard:
+                selected = (base, .configured)
+            case .fast:
+                guard let multiplier = decimal(rates.fast?.billingMultiplier) else { continue }
+                selected = (base * multiplier, .configured)
+            case .fallbackStandard:
+                selected = (base, .standard)
+            }
 
-            guard segment.tierSource != "current_config_fallback", let tier = segment.tier else {
-                continue
-            }
-            if standardTiers.contains(tier) {
-                configuredAmount += base
-                configuredTokens = addingWithoutOverflow(configuredTokens, usage.totalTokens)
-            } else if fastTiers.contains(tier), let multiplier = decimal(rates.fast?.billingMultiplier) {
-                configuredAmount += base * multiplier
-                configuredTokens = addingWithoutOverflow(configuredTokens, usage.totalTokens)
-            }
+            estimatedAmount += selected.amount
+            bases.insert(selected.basis)
+            pricedTokens = addingWithoutOverflow(pricedTokens, usage.totalTokens)
+            hasAmount = true
         }
 
-        if totalTokens > 0, configuredTokens == totalTokens {
-            return CreditEstimate(
-                amount: configuredAmount,
-                basis: .configured,
-                pricedTokens: configuredTokens,
-                totalTokens: totalTokens
-            )
-        }
         return CreditEstimate(
-            amount: standardTokens > 0 ? standardAmount : nil,
-            basis: .standard,
-            pricedTokens: standardTokens,
+            amount: hasAmount ? estimatedAmount : nil,
+            basis: creditBasis(for: bases),
+            pricedTokens: pricedTokens,
             totalTokens: totalTokens
         )
     }
@@ -203,10 +197,10 @@ public struct CreditEstimator: Sendable {
         _ segments: [UsageSegment],
         expectedTotalTokens: Int64? = nil
     ) -> APIPriceEstimate {
-        var standardAmount = Decimal.zero
-        var configuredAmount = Decimal.zero
-        var standardTokens: Int64 = 0
-        var configuredTokens: Int64 = 0
+        var estimatedAmount = Decimal.zero
+        var hasAmount = false
+        var bases = Set<APIPriceEstimateBasis>()
+        var pricedTokens: Int64 = 0
         let segmentTokens = segments.reduce(Int64.zero) {
             addingWithoutOverflow($0, $1.usage.totalTokens)
         }
@@ -222,36 +216,29 @@ public struct CreditEstimator: Sendable {
                 let standard = amount(for: segment, api: api, groups: api.standard, unit: unit)
             else { continue }
 
-            standardAmount += standard
-            standardTokens = addingWithoutOverflow(standardTokens, segment.usage.totalTokens)
+            let selected: (amount: Decimal, basis: APIPriceEstimateBasis)
+            switch pricingTier(for: segment) {
+            case .standard:
+                selected = (standard, .configured)
+            case .fast:
+                guard let fast = amount(for: segment, api: api, groups: api.fast, unit: unit) else {
+                    continue
+                }
+                selected = (fast, .configured)
+            case .fallbackStandard:
+                selected = (standard, .standard)
+            }
 
-            guard segment.tierSource != "current_config_fallback", let tier = segment.tier else {
-                continue
-            }
-            if standardTiers.contains(tier) {
-                configuredAmount += standard
-                configuredTokens = addingWithoutOverflow(configuredTokens, segment.usage.totalTokens)
-            } else if
-                fastTiers.contains(tier),
-                let fast = amount(for: segment, api: api, groups: api.fast, unit: unit)
-            {
-                configuredAmount += fast
-                configuredTokens = addingWithoutOverflow(configuredTokens, segment.usage.totalTokens)
-            }
+            estimatedAmount += selected.amount
+            bases.insert(selected.basis)
+            pricedTokens = addingWithoutOverflow(pricedTokens, segment.usage.totalTokens)
+            hasAmount = true
         }
 
-        if totalTokens > 0, configuredTokens == totalTokens {
-            return APIPriceEstimate(
-                amount: configuredAmount,
-                basis: .configured,
-                pricedTokens: configuredTokens,
-                totalTokens: totalTokens
-            )
-        }
         return APIPriceEstimate(
-            amount: standardTokens > 0 ? standardAmount : nil,
-            basis: .standard,
-            pricedTokens: standardTokens,
+            amount: hasAmount ? estimatedAmount : nil,
+            basis: apiBasis(for: bases),
+            pricedTokens: pricedTokens,
             totalTokens: totalTokens
         )
     }
@@ -268,21 +255,20 @@ public struct CreditEstimator: Sendable {
         let efforts = Set(segments.compactMap(\.effort))
         if efforts.count == 1, let effort = efforts.first { pieces.append(effort) }
 
-        let tiers = Set(segments.compactMap(\.tier))
-        if tiers.count == 1, let tier = tiers.first {
-            if fastTiers.contains(tier) {
-                if let speed = entry?.codexCredits?.fast?.speedMultiplierNominal {
-                    pieces.append("Fast \(speed)×")
-                } else {
-                    pieces.append("Fast")
-                }
-            } else if standardTiers.contains(tier) {
-                pieces.append("Standard")
+        let effectiveTiers = Set(segments.map { pricingTier(for: $0) })
+        if effectiveTiers == [.fast] {
+            if let speed = entry?.codexCredits?.fast?.speedMultiplierNominal {
+                pieces.append("Fast \(speed)×")
             } else {
-                pieces.append(tier)
+                pieces.append("Fast")
             }
-        } else if tiers.count > 1 {
+        } else if effectiveTiers.contains(.fast) {
             pieces.append("混合档位")
+        } else if !effectiveTiers.isEmpty {
+            // Missing, unknown, and current-config fallback tiers all use the
+            // Standard estimate. Do not label a session as Fast merely because
+            // the fallback config happened to contain "priority".
+            pieces.append("Standard")
         }
         return pieces.joined(separator: " · ")
     }
@@ -290,6 +276,37 @@ public struct CreditEstimator: Sendable {
     private func decimal(_ text: String?) -> Decimal? {
         guard let text else { return nil }
         return Decimal(string: text, locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    /// Chooses the price for one observed accounting bucket. A tier is only
+    /// authoritative when it came from the transcript itself. Config-file
+    /// fallbacks and unknown tier values deliberately use Standard so a mixed
+    /// task can retain safe partial coverage without repricing known Fast use.
+    private func pricingTier(for segment: UsageSegment) -> PricingTier {
+        let source = normalized(segment.tierSource)
+        guard source != "current_config_fallback", let tier = normalized(segment.tier) else {
+            return .fallbackStandard
+        }
+        if standardTiers.contains(tier) { return .standard }
+        if fastTiers.contains(tier) { return .fast }
+        return .fallbackStandard
+    }
+
+    private func normalized(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return value.lowercased()
+    }
+
+    private func creditBasis(for bases: Set<CreditEstimateBasis>) -> CreditEstimateBasis {
+        if bases.count > 1 || bases.contains(.mixed) { return .mixed }
+        return bases.first ?? .standard
+    }
+
+    private func apiBasis(for bases: Set<APIPriceEstimateBasis>) -> APIPriceEstimateBasis {
+        if bases.count > 1 || bases.contains(.mixed) { return .mixed }
+        return bases.first ?? .standard
     }
 
     private func amount(
@@ -365,5 +382,11 @@ public struct CreditEstimator: Sendable {
     private func addingWithoutOverflow(_ lhs: Int64, _ rhs: Int64) -> Int64 {
         let (result, overflow) = lhs.addingReportingOverflow(rhs)
         return overflow ? Int64.max : result
+    }
+
+    private enum PricingTier: Hashable {
+        case standard
+        case fast
+        case fallbackStandard
     }
 }

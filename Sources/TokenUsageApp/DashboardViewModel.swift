@@ -341,7 +341,7 @@ final class DashboardViewModel: ObservableObject {
                 }
             }
             isSyncingHistory = false
-            historyMessage = "历史同步完成：\(homes.count) 个目录，新增 \(generated)，已有 \(skipped)，失败 \(failed)"
+            historyMessage = "历史同步完成：\(homes.count) 个目录，新建或重建 \(generated)，已是最新 \(skipped)，失败 \(failed)"
             if unavailable > 0 { historyMessage? += "；\(unavailable) 个目录不可用" }
             reload(startMonitor: true)
         }

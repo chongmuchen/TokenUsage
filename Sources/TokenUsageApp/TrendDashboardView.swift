@@ -6,7 +6,7 @@ struct TrendDashboardView: View {
     let result: UsageTrendResult
 
     @State private var visibleTokenMetrics = Set(TrendTokenMetric.allCases)
-    @State private var priceMetric: TrendPriceMetric = .credits
+    @State private var priceMetric: TrendPriceMetric = .apiUSD
 
     var body: some View {
         if result.series.isEmpty {
@@ -86,11 +86,16 @@ enum TrendTokenMetric: String, CaseIterable, Identifiable, Hashable {
 }
 
 enum TrendPriceMetric: String, CaseIterable, Identifiable {
-    case credits
     case apiUSD
+    case credits
 
     var id: String { rawValue }
-    var title: String { self == .credits ? "Credits 估算" : "API USD 等价" }
+    var title: String {
+        switch self {
+        case .apiUSD: "API USD 等价"
+        case .credits: "Credits 估算"
+        }
+    }
 }
 
 private struct TrendTokenChart: View {
@@ -345,8 +350,14 @@ private enum TrendConfigurationStyle {
 private struct TrendPriceChart: View {
     let result: UsageTrendResult
     @Binding var metric: TrendPriceMetric
+    @State private var hoveredPointID: TrendPricePoint.ID?
+    @Environment(\.calendar) private var calendar
+
+    private let hoverHitRadius: CGFloat = 20
 
     var body: some View {
+        let points = pricePoints
+
         TrendCard(
             title: "每日价格",
             subtitle: "公开价估算；Credits 与 API USD 是两种口径，不应相加。"
@@ -360,9 +371,9 @@ private struct TrendPriceChart: View {
             .labelsHidden()
             .frame(width: 250)
         } content: {
-            Chart(pricePoints) { point in
+            Chart(points) { point in
                 LineMark(
-                    x: .value("日期", point.day, unit: .day),
+                    x: .value("日期", point.day, unit: .day, calendar: calendar),
                     y: .value(metric.title, point.amount),
                     series: .value("连续定价区间", point.runID)
                 )
@@ -370,11 +381,34 @@ private struct TrendPriceChart: View {
                 .interpolationMethod(.linear)
 
                 PointMark(
-                    x: .value("日期", point.day, unit: .day),
+                    x: .value("日期", point.day, unit: .day, calendar: calendar),
                     y: .value(metric.title, point.amount)
                 )
                 .foregroundStyle(by: .value("曲线", point.seriesName))
                 .symbolSize(result.days.count <= 45 ? 22 : 9)
+
+                if point.id == hoveredPointID {
+                    PointMark(
+                        x: .value("悬浮日期", point.day, unit: .day, calendar: calendar),
+                        y: .value("悬浮数值", point.amount)
+                    )
+                    .foregroundStyle(by: .value("曲线", point.seriesName))
+                    .symbolSize(78)
+                    .annotation(
+                        position: .top,
+                        spacing: 8,
+                        overflowResolution: .init(
+                            x: .fit(to: .chart),
+                            y: .fit(to: .chart)
+                        )
+                    ) {
+                        TrendPriceTooltip(
+                            point: point,
+                            metric: metric,
+                            showsSeriesName: result.series.count > 1
+                        )
+                    }
+                }
             }
             .chartYAxis {
                 AxisMarks(position: .leading) { value in
@@ -401,9 +435,108 @@ private struct TrendPriceChart: View {
                 range: result.series.indices.map { TrendSeriesPalette.color(at: $0) }
             )
             .chartLegend(result.series.count <= 6 ? .visible : .hidden)
+            .chartOverlay { proxy in
+                GeometryReader { geometry in
+                    Rectangle()
+                        .fill(.clear)
+                        .contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case let .active(location):
+                                updateHoveredPoint(
+                                    at: location,
+                                    points: points,
+                                    proxy: proxy,
+                                    geometry: geometry
+                                )
+                            case .ended:
+                                hoveredPointID = nil
+                            }
+                        }
+                }
+            }
             .frame(height: 240)
             .accessibilityLabel("按日\(metric.title)曲线")
         }
+        .onChange(of: metric) { _, _ in
+            hoveredPointID = nil
+        }
+        .onChange(of: points) { _, _ in
+            hoveredPointID = nil
+        }
+    }
+
+    private func updateHoveredPoint(
+        at location: CGPoint,
+        points: [TrendPricePoint],
+        proxy: ChartProxy,
+        geometry: GeometryProxy
+    ) {
+        guard let plotFrameAnchor = proxy.plotFrame else {
+            hoveredPointID = nil
+            return
+        }
+        let plotFrame = geometry[plotFrameAnchor]
+        guard plotFrame.contains(location) else {
+            hoveredPointID = nil
+            return
+        }
+
+        let plotLocation = CGPoint(
+            x: location.x - plotFrame.minX,
+            y: location.y - plotFrame.minY
+        )
+        let closestID = closestPointID(
+            to: plotLocation,
+            points: points,
+            proxy: proxy
+        )
+        if hoveredPointID != closestID {
+            hoveredPointID = closestID
+        }
+    }
+
+    private func closestPointID(
+        to location: CGPoint,
+        points: [TrendPricePoint],
+        proxy: ChartProxy
+    ) -> TrendPricePoint.ID? {
+        var bestMatch: (distance: CGFloat, pointID: TrendPricePoint.ID)?
+
+        for point in points {
+            guard let position = proxy.position(
+                for: (x: plottedDay(for: point.day), y: point.amount)
+            ) else { continue }
+            considerMatch(
+                distance: distance(from: location, to: position),
+                pointID: point.id,
+                bestMatch: &bestMatch
+            )
+        }
+
+        guard let bestMatch, bestMatch.distance <= hoverHitRadius else { return nil }
+        return bestMatch.pointID
+    }
+
+    private func considerMatch(
+        distance: CGFloat,
+        pointID: TrendPricePoint.ID,
+        bestMatch: inout (distance: CGFloat, pointID: TrendPricePoint.ID)?
+    ) {
+        guard distance < (bestMatch?.distance ?? .infinity) else { return }
+        bestMatch = (distance, pointID)
+    }
+
+    private func distance(from point: CGPoint, to target: CGPoint) -> CGFloat {
+        hypot(point.x - target.x, point.y - target.y)
+    }
+
+    /// Date marks plotted with `unit: .day` sit at the middle of the calendar
+    /// day. ChartProxy positions a raw Date at its exact time, so using the
+    /// bucket's midnight would miss the visible point by half a day.
+    private func plottedDay(for day: Date) -> Date {
+        guard let interval = calendar.dateInterval(of: .day, for: day) else { return day }
+        return interval.start.addingTimeInterval(interval.duration / 2)
     }
 
     private func price(_ aggregate: UsageTrendAggregate) -> Decimal? {
@@ -431,20 +564,69 @@ private struct TrendPriceChart: View {
                     seriesName: series.name,
                     runID: "\(series.name)#\(run)",
                     day: point.day,
-                    amount: decimalDouble(amount)
+                    amount: decimalDouble(amount),
+                    exactAmount: amount
                 )
             }
         }
     }
 }
 
-private struct TrendPricePoint: Identifiable {
+private struct TrendPricePoint: Identifiable, Equatable {
     let seriesName: String
     let runID: String
     let day: Date
     let amount: Double
+    let exactAmount: Decimal
 
     var id: String { "\(runID)#\(day.timeIntervalSinceReferenceDate)" }
+}
+
+private struct TrendPriceTooltip: View {
+    let point: TrendPricePoint
+    let metric: TrendPriceMetric
+    let showsSeriesName: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(point.day, format: .dateTime.year().month(.twoDigits).day(.twoDigits))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if showsSeriesName {
+                Text(point.seriesName)
+                    .font(.caption2)
+                    .lineLimit(1)
+            }
+            Text(TrendPriceTooltipFormatter.string(point.exactAmount, metric: metric))
+                .font(.caption.weight(.semibold))
+                .monospacedDigit()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+        .overlay {
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private enum TrendPriceTooltipFormatter {
+    private static let formatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 6
+        return formatter
+    }()
+
+    static func string(_ value: Decimal, metric: TrendPriceMetric) -> String {
+        let amount = formatter.string(from: value as NSDecimalNumber)
+            ?? (value as NSDecimalNumber).stringValue
+        return metric == .apiUSD ? "$\(amount)" : "\(amount) cr"
+    }
 }
 
 private struct TrendCard<Accessory: View, Content: View>: View {

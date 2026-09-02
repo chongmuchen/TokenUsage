@@ -5,14 +5,25 @@ struct UsageTableView: View {
     let rows: [UsageTreeRow]
 
     @State private var selection = Set<UsageTreeRow.ID>()
+    @State private var sortOrder: [UsageRowSortComparator] = []
     @SceneStorage("usage-table-columns")
     private var columnCustomization = TableColumnCustomization<UsageTreeRow>()
 
+    private var sortedRows: [UsageTreeRow] {
+        guard !sortOrder.isEmpty else { return rows }
+        let summaryRows = rows.filter { $0.kind == .summary }
+        return rows
+            .filter { $0.kind != .summary }
+            .sorted(using: sortOrder)
+            + summaryRows
+    }
+
     var body: some View {
         Table(
-            rows,
+            sortedRows,
             children: \.children,
             selection: $selection,
+            sortOrder: $sortOrder,
             columnCustomization: $columnCustomization
         ) {
             TableColumn("时间") { row in
@@ -27,7 +38,10 @@ struct UsageTableView: View {
             .width(min: 230, ideal: 340, max: .infinity)
             .customizationID("name")
 
-            TableColumn("Token（总 / 自身）") { row in
+            TableColumn(
+                "Token（总 / 自身）",
+                sortUsing: UsageRowSortComparator(field: .totalTokens)
+            ) { row in
                 TotalAndOwnTokenCell(row: row)
             }
             .width(min: 120, ideal: 138, max: 170)
@@ -74,13 +88,78 @@ struct UsageTableView: View {
             .width(min: 120, ideal: 140, max: 175)
             .customizationID("credits")
 
-            TableColumn("API USD 等价") { row in
+            TableColumn(
+                "API USD 等价",
+                sortUsing: UsageRowSortComparator(field: .apiUSD)
+            ) { row in
                 APIPriceCell(estimate: row.apiPriceEstimate, warnings: row.warnings)
             }
             .width(min: 130, ideal: 150, max: 185)
             .customizationID("api-price")
         }
         .tableStyle(.inset(alternatesRowBackgrounds: true))
+    }
+}
+
+private struct UsageRowSortComparator: SortComparator {
+    enum Field {
+        case totalTokens
+        case apiUSD
+    }
+
+    let field: Field
+    var order: SortOrder = .forward
+
+    func compare(_ lhs: UsageTreeRow, _ rhs: UsageTreeRow) -> ComparisonResult {
+        switch field {
+        case .totalTokens:
+            let result = compareValues(lhs.subtreeUsage.totalTokens, rhs.subtreeUsage.totalTokens)
+            return result == .orderedSame
+                ? stableFallback(lhs, rhs)
+                : applyingOrder(to: result)
+        case .apiUSD:
+            return compareAPIPrice(lhs, rhs)
+        }
+    }
+
+    private func compareAPIPrice(_ lhs: UsageTreeRow, _ rhs: UsageTreeRow) -> ComparisonResult {
+        switch (lhs.apiPriceEstimate?.amount, rhs.apiPriceEstimate?.amount) {
+        case let (left?, right?):
+            let result = compareValues(left, right)
+            return result == .orderedSame
+                ? stableFallback(lhs, rhs)
+                : applyingOrder(to: result)
+        case (nil, nil):
+            return stableFallback(lhs, rhs)
+        case (nil, _?):
+            return .orderedDescending
+        case (_?, nil):
+            return .orderedAscending
+        }
+    }
+
+    private func compareValues<Value: Comparable>(_ lhs: Value, _ rhs: Value) -> ComparisonResult {
+        if lhs < rhs { return .orderedAscending }
+        if lhs > rhs { return .orderedDescending }
+        return .orderedSame
+    }
+
+    /// Equal values retain a deterministic, useful order across refreshes.
+    private func stableFallback(_ lhs: UsageTreeRow, _ rhs: UsageTreeRow) -> ComparisonResult {
+        let leftTime = lhs.time ?? .distantPast
+        let rightTime = rhs.time ?? .distantPast
+        if leftTime > rightTime { return .orderedAscending }
+        if leftTime < rightTime { return .orderedDescending }
+        return compareValues(lhs.id, rhs.id)
+    }
+
+    private func applyingOrder(to result: ComparisonResult) -> ComparisonResult {
+        guard order == .reverse else { return result }
+        switch result {
+        case .orderedAscending: return .orderedDescending
+        case .orderedDescending: return .orderedAscending
+        case .orderedSame: return .orderedSame
+        }
     }
 }
 

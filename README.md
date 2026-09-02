@@ -36,6 +36,12 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 open ".build/app/Token Usage.app"
 ```
 
+完成代码修改后，一键构建 Release、更新“应用程序”中的安装副本、校验并重新打开：
+
+```sh
+./Scripts/update-installed-app.sh
+```
+
 应用图标的 1024px+ 主图和标准 macOS `.icns` 分别保存在 `Support/AppIconMaster.png` 与 `Support/AppIcon.icns`；构建脚本会自动将图标复制到 App bundle。
 
 也可以在 Xcode 中直接打开 `Package.swift`。
@@ -45,6 +51,7 @@ open ".build/app/Token Usage.app"
 默认数据目录是 `~/.codex`。工具栏的 Codex Home 菜单可以启停任意目录、继续添加其他目录，或移除非默认目录；选择结果用 security-scoped bookmark 保存。跨目录遇到相同 `root_thread_id` 时，只采用生成时间最新的报告，避免复制或迁移目录后重复计数。
 
 - 普通刷新只读 `token-usage/reports/*.json`，并只读 `state_*.sqlite` 的 `first_user_message` 来生成短标题。
+- Codex Hook 在每轮 `Stop` 后原子写入报告，因此运行中的回复不会逐 token 更新；界面会显示最后一个真实 token 分钟的“用量截至”和本次磁盘加载的“读取于”。App 会先建立目录监听再初次读取，并用低成本文件元数据指纹及重新激活检查兜底漏掉的文件事件。
 - “同步当前日期范围”会运行随 App 打包的本地解析器：为缺失报告的用户会话生成 per-session JSON/TXT，并重建仍是下界、曾因计数校验而抑制价格、或使用旧价目快照的已有报告；内容完整且使用当前价目的报告会跳过。它不会调用 Codex 模型或 OpenAI API，也不会覆盖实时的 `latest.json/latest.txt`。
 - 解析器只提取计量所需白名单字段。图片生成可额外记录用户输入提示词和模型 `revised_prompt` 的空白归一化预览（各最多 240 个字符及截断标记），以及尺寸、质量、格式、像素和字节数等标量；不会写入完整 prompt、普通工具参数/输出、图片内容或图片路径。
 - App 不联网、不使用 MCP，也不把 `/status` 或任何提示注入会话，因此不会增加模型 token 或影响原任务上下文。

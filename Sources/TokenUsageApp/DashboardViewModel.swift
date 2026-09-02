@@ -8,6 +8,18 @@ private struct LoadedUsageCandidate: Sendable {
     let report: UsageReport
 }
 
+private struct ReportFileFingerprint: Equatable {
+    let name: String
+    let resourceIdentifier: String?
+    let modifiedAt: Date?
+    let byteCount: Int
+}
+
+private struct ReportDirectoryFingerprint: Equatable {
+    let path: String
+    let files: [ReportFileFingerprint]?
+}
+
 @MainActor
 final class DashboardViewModel: ObservableObject {
     @Published private(set) var sessions: [UsageTreeRow] = []
@@ -37,6 +49,8 @@ final class DashboardViewModel: ObservableObject {
     private var monitors: [String: ReportDirectoryMonitor] = [:]
     private var securityScopedURLs: [UUID: URL] = [:]
     private var loadGeneration = 0
+    private var lastLoadedReportFingerprint: [ReportDirectoryFingerprint]?
+    private var fallbackRefreshTask: Task<Void, Never>?
 
     init() {
         let bookmarkStore = SecurityScopedBookmarkStore()
@@ -58,9 +72,11 @@ final class DashboardViewModel: ObservableObject {
             ?? CodexPaths.defaultRoot
         beginSecurityScopedAccess()
         reload(startMonitor: true)
+        startFallbackRefresh()
     }
 
     deinit {
+        fallbackRefreshTask?.cancel()
         monitors.values.forEach { $0.stop() }
         securityScopedURLs.values.forEach { $0.stopAccessingSecurityScopedResource() }
     }
@@ -96,6 +112,17 @@ final class DashboardViewModel: ObservableObject {
     var trendModelOptions: [UsageTrendModelOption] { unfilteredTrendDimensions.models }
     var trendEffortOptions: [String] { unfilteredTrendDimensions.efforts }
     var trendSpeedOptions: [UsageTrendSpeed] { unfilteredTrendDimensions.speeds }
+
+    var latestUsageObservedAt: Date? {
+        reports.compactMap { report in
+            report.task.usageSamples?.compactMap(\.minute).max()
+                ?? report.threads
+                    .flatMap(\.turns)
+                    .compactMap { $0.lastUsageAt ?? $0.completedAt ?? $0.startedAt }
+                    .max()
+                ?? report.generatedAt
+        }.max()
+    }
 
     private var unfilteredTrendDimensions: UsageTrendDimensions {
         trendAggregator.aggregate(
@@ -211,12 +238,18 @@ final class DashboardViewModel: ObservableObject {
         let automaticHomes = automaticCodexHomes(excluding: registeredHomes)
         let allSources = registeredHomes + automaticHomes
         let automaticIDs = Set(automaticHomes.map(\.id))
+        // Subscribe before the first directory enumeration. If a report is
+        // atomically written while an initial/retry load is in flight, the
+        // monitor schedules a newer generation instead of leaving the UI on
+        // the snapshot taken just before that write.
+        let monitorIssues = startMonitor ? installMonitors() : []
+        let loadFingerprint = reportFingerprint(for: allSources)
         isLoading = true
         errorMessage = nil
 
         Task {
             var winners: [String: LoadedUsageCandidate] = [:]
-            var issues: [ReportLoadIssue] = []
+            var issues = monitorIssues
             var successfulHomes = 0
             var duplicates = 0
 
@@ -292,6 +325,7 @@ final class DashboardViewModel: ObservableObject {
             sessions = rows
             loadIssues = issues
             duplicateSessionCount = duplicates
+            lastLoadedReportFingerprint = loadFingerprint
             isLoading = false
             lastUpdated = Date()
             if successfulHomes == 0 {
@@ -301,7 +335,37 @@ final class DashboardViewModel: ObservableObject {
             } else {
                 errorMessage = nil
             }
-            if startMonitor { installMonitors() }
+        }
+    }
+
+    /// Reconciles the UI with disk without rereading every report on every
+    /// timer tick. A changed metadata fingerprint means a vnode event was
+    /// missed (for example during process startup), so the retry also repairs
+    /// the directory subscription before loading.
+    func refreshIfReportsChanged() {
+        guard !isLoading else { return }
+        let sources = homes + automaticCodexHomes(excluding: homes)
+        let currentFingerprint = reportFingerprint(for: sources)
+        guard let lastLoadedReportFingerprint else {
+            reload(startMonitor: true)
+            return
+        }
+        guard currentFingerprint != lastLoadedReportFingerprint else { return }
+        reload(startMonitor: true)
+    }
+
+    private func startFallbackRefresh() {
+        fallbackRefreshTask?.cancel()
+        fallbackRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(5))
+                } catch {
+                    return
+                }
+                guard let self else { return }
+                self.refreshIfReportsChanged()
+            }
         }
     }
 
@@ -347,10 +411,12 @@ final class DashboardViewModel: ObservableObject {
         }
     }
 
-    private func installMonitors() {
+    @discardableResult
+    private func installMonitors() -> [ReportLoadIssue] {
         stopMonitors()
         let sources = homes.filter(\.isActive) + automaticCodexHomes(excluding: homes)
         var monitoredPaths = Set<String>()
+        var issues: [ReportLoadIssue] = []
 
         func install(key: String, directory: URL, home: CodexHome) {
             let path = directory.standardizedFileURL.path(percentEncoded: false)
@@ -359,22 +425,68 @@ final class DashboardViewModel: ObservableObject {
             do {
                 try monitor.start(directory: directory) { [weak self] in
                     Task { @MainActor [weak self] in
-                        self?.reload(startMonitor: true)
+                        // Ordinary report writes do not invalidate the open
+                        // directory descriptor. Keeping the existing monitor
+                        // closes the gap previously created by tearing it down
+                        // and recreating it for every file event.
+                        self?.reload()
                     }
                 }
                 monitors[key] = monitor
             } catch {
-                appendIssueIfNeeded(homeIssue(home, suffix: "monitor", message: error.localizedDescription))
+                issues.append(homeIssue(home, suffix: "monitor", message: error.localizedDescription))
             }
         }
 
         for home in sources where home.isActive {
             guard let directory = monitorDirectory(for: home) else {
-                appendIssueIfNeeded(homeIssue(home, suffix: "monitor", message: "目录不存在，无法监控"))
+                issues.append(homeIssue(home, suffix: "monitor", message: "目录不存在，无法监控"))
                 continue
             }
             install(key: "reports:\(home.id.uuidString)", directory: directory, home: home)
         }
+        return issues
+    }
+
+    private func reportFingerprint(for sources: [CodexHome]) -> [ReportDirectoryFingerprint] {
+        let keys: Set<URLResourceKey> = [
+            .contentModificationDateKey,
+            .fileResourceIdentifierKey,
+            .fileSizeKey,
+            .isRegularFileKey
+        ]
+        var paths = Set<String>()
+        var fingerprints: [ReportDirectoryFingerprint] = []
+
+        for home in sources where home.isActive {
+            let directory = CodexPaths.reportsDirectory(for: home.rootURL).standardizedFileURL
+            let path = directory.path(percentEncoded: false)
+            guard paths.insert(path).inserted else { continue }
+
+            guard let urls = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: Array(keys),
+                options: [.skipsHiddenFiles]
+            ) else {
+                fingerprints.append(ReportDirectoryFingerprint(path: path, files: nil))
+                continue
+            }
+
+            let files = urls.compactMap { url -> ReportFileFingerprint? in
+                guard url.pathExtension.lowercased() == "json",
+                      let values = try? url.resourceValues(forKeys: keys),
+                      values.isRegularFile == true else { return nil }
+                return ReportFileFingerprint(
+                    name: url.lastPathComponent,
+                    resourceIdentifier: values.fileResourceIdentifier.map { String(reflecting: $0) },
+                    modifiedAt: values.contentModificationDate,
+                    byteCount: values.fileSize ?? 0
+                )
+            }.sorted { $0.name < $1.name }
+            fingerprints.append(ReportDirectoryFingerprint(path: path, files: files))
+        }
+
+        return fingerprints.sorted { $0.path < $1.path }
     }
 
     private func monitorDirectory(for home: CodexHome) -> URL? {

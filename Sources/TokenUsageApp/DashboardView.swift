@@ -1,3 +1,5 @@
+import AppKit
+import Combine
 import SwiftUI
 import TokenUsageCore
 
@@ -38,6 +40,9 @@ struct DashboardView: View {
             statusBar
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            viewModel.refreshIfReportsChanged()
+        }
     }
 
     private var header: some View {
@@ -80,6 +85,7 @@ struct DashboardView: View {
             }
             .keyboardShortcut("r", modifiers: [.command])
             .disabled(viewModel.isLoading)
+            .help("重新读取已落盘报告；运行中的会话会在本轮 Stop 后更新")
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 14)
@@ -197,9 +203,14 @@ struct DashboardView: View {
             } else {
                 Text("\(viewModel.trendResult.series.count) 条曲线 · \(viewModel.trendResult.days.count) 天")
             }
+            if let observedAt = viewModel.latestUsageObservedAt {
+                Text("·")
+                Text("用量截至 \(observedAt, format: .dateTime.hour().minute().second())")
+                    .help("Codex Stop Hook 在每轮结束后写入报告；运行中的回复不会逐 token 更新")
+            }
             if let updated = viewModel.lastUpdated {
                 Text("·")
-                Text("更新于 \(updated, format: .dateTime.hour().minute().second())")
+                Text("读取于 \(updated, format: .dateTime.hour().minute().second())")
             }
         }
         .font(.caption)

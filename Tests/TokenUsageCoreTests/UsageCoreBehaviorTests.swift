@@ -270,10 +270,11 @@ func treeAttributionAndAccounting() throws {
     #expect(ids.filter { $0 == "thread:agent-side" }.count == 1)
 }
 
-@Test("Credits and API prices use separate public rate tables")
-func creditsAndAPIPricesAreBothEstimated() throws {
+@Test("Credits and API prices use separate public rate tables", arguments: ["gpt-5.6-sol", "gpt-6-astra"])
+func creditsAndAPIPricesAreBothEstimated(model: String) throws {
     let catalog = try PricingCatalog.bundled()
     let estimator = CreditEstimator(catalog: catalog)
+    let priceMultiplier = model == "gpt-6-astra" ? Decimal(string: "2.5")! : Decimal(1)
     let usage = TokenUsage(
         inputTokens: 1_000_000,
         cachedInputTokens: 200_000,
@@ -282,7 +283,7 @@ func creditsAndAPIPricesAreBothEstimated() throws {
         reasoningOutputTokens: 40_000
     )
     let standard = UsageSegment(
-        model: "gpt-5.6-sol",
+        model: model,
         effort: "medium",
         tier: "default",
         tierSource: "thread_settings",
@@ -295,14 +296,14 @@ func creditsAndAPIPricesAreBothEstimated() throws {
     )
     let credits = estimator.estimate([standard])
     let api = estimator.estimateAPI([standard])
-    #expect(credits.amount == Decimal(string: "132"))
+    #expect(credits.amount == Decimal(132) * priceMultiplier)
     // The segment records per-request long-context status. Its aggregate may
     // exceed 272k because it contains many short requests and must stay short.
-    #expect(api.amount == Decimal(string: "5.38"))
+    #expect(api.amount == Decimal(string: "5.38")! * priceMultiplier)
     #expect(api.basis == .configured)
 
     let fast = UsageSegment(
-        model: "gpt-5.6-sol",
+        model: model,
         effort: "medium",
         tier: "priority",
         tierSource: "thread_settings",
@@ -313,11 +314,14 @@ func creditsAndAPIPricesAreBothEstimated() throws {
         lastAt: nil,
         requestCount: 1
     )
-    #expect(estimator.estimate([fast]).amount == Decimal(string: "330"))
-    #expect(estimator.estimateAPI([fast]).amount == Decimal(string: "10.76"))
+    #expect(estimator.estimate([fast]).amount == Decimal(330) * priceMultiplier)
+    #expect(estimator.estimateAPI([fast]).amount == Decimal(string: "10.76")! * priceMultiplier)
+    if model == "gpt-6-astra" {
+        #expect(estimator.modelSummary(for: [fast]) == "GPT-6 Astra · medium · Fast")
+    }
 
     let long = UsageSegment(
-        model: "gpt-5.6-sol",
+        model: model,
         effort: "medium",
         tier: "default",
         tierSource: "thread_settings",
@@ -328,10 +332,10 @@ func creditsAndAPIPricesAreBothEstimated() throws {
         lastAt: nil,
         requestCount: 1
     )
-    #expect(estimator.estimateAPI([long]).amount == Decimal(string: "9.76"))
+    #expect(estimator.estimateAPI([long]).amount == Decimal(string: "9.76")! * priceMultiplier)
 
     let unknownContext = UsageSegment(
-        model: "gpt-5.6-sol",
+        model: model,
         effort: "medium",
         tier: "default",
         tierSource: "thread_settings",

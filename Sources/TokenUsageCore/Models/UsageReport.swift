@@ -445,6 +445,40 @@ public struct PricingCatalogReference: Codable, Equatable, Sendable {
     public let scope: String?
 }
 
+/// One observed rate-limit bucket emitted alongside a token-usage snapshot.
+/// The bucket name is retained as source metadata; consumers should identify
+/// a weekly limit by its duration rather than assuming primary or secondary.
+public struct RateLimitSnapshot: Codable, Equatable, Hashable, Sendable {
+    public let observedAt: Date
+    public let limitId: String
+    public let limitName: String?
+    public let bucket: String
+    public let usedPercent: Double
+    public let windowMinutes: Int64
+    public let resetsAt: Date
+    public let planType: String?
+
+    public init(
+        observedAt: Date,
+        limitId: String,
+        limitName: String? = nil,
+        bucket: String,
+        usedPercent: Double,
+        windowMinutes: Int64,
+        resetsAt: Date,
+        planType: String? = nil
+    ) {
+        self.observedAt = observedAt
+        self.limitId = limitId
+        self.limitName = limitName
+        self.bucket = bucket
+        self.usedPercent = usedPercent
+        self.windowMinutes = windowMinutes
+        self.resetsAt = resetsAt
+        self.planType = planType
+    }
+}
+
 public struct UsageReport: Codable, Equatable, Identifiable, Sendable {
     public let reportSchemaVersion: Int
     public let generatedAt: Date
@@ -456,6 +490,9 @@ public struct UsageReport: Codable, Equatable, Identifiable, Sendable {
     /// Additive report-v1 metadata. `nil` means the producer predates image
     /// details; counts remain authoritative in that case.
     public let imageGenerations: [ImageGenerationDetail]?
+    /// Additive report-v1 rate-limit observations. `nil` means the producer
+    /// predates rate-limit capture rather than that the account has no limit.
+    public let rateLimitSnapshots: [RateLimitSnapshot]?
     public let currentTurn: CurrentTurnSummary
     public let task: TaskSummary
     public let threads: [ThreadSummary]

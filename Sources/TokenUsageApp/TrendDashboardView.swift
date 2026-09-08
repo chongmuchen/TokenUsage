@@ -4,21 +4,28 @@ import TokenUsageCore
 
 struct TrendDashboardView: View {
     let result: UsageTrendResult
+    let weeklyLimitOverview: WeeklyLimitOverview?
 
     @State private var visibleTokenMetrics = Set(TrendTokenMetric.allCases)
     @State private var priceMetric: TrendPriceMetric = .apiUSD
 
     var body: some View {
-        if result.series.isEmpty {
-            ContentUnavailableView {
-                Label("没有符合条件的趋势数据", systemImage: "chart.xyaxis.line")
-            } description: {
-                Text("调整时间、模型、推理强度或速度筛选；旧报告也可以先同步为分钟级报告。")
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 16) {
+                WeeklyLimitProjectionCard(projection: weeklyLimitOverview?.current)
+                WeeklyLimitHistoryCard(
+                    history: Array((weeklyLimitOverview?.history ?? []).prefix(8)),
+                    computedAt: weeklyLimitOverview?.computedAt
+                )
+
+                if result.series.isEmpty {
+                    ContentUnavailableView {
+                        Label("没有符合条件的趋势数据", systemImage: "chart.xyaxis.line")
+                    } description: {
+                        Text("调整时间、模型、推理强度或速度筛选；旧报告也可以先同步为分钟级报告。")
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 320)
+                } else {
                     if !result.warnings.isEmpty {
                         TrendWarningCard(warnings: result.warnings)
                     }
@@ -35,9 +42,345 @@ struct TrendDashboardView: View {
 
                     TrendSummaryTable(result: result)
                 }
-                .padding(16)
+            }
+            .padding(16)
+        }
+    }
+}
+
+private struct WeeklyLimitProjectionCard: View {
+    let projection: WeeklyLimitProjection?
+
+    var body: some View {
+        TrendCard(
+            title: "当前周限额预估",
+            subtitle: "按服务端本次 7 天窗口的本地用量结构线性估算；Token 与 API USD 都是等价值，不是固定配额或账单。"
+        ) {
+            if let projection {
+                HStack(spacing: 6) {
+                    Text(limitName(projection))
+                        .lineLimit(1)
+                    confidenceBadge(projection.confidence)
+                    if projection.isApproximate {
+                        badge("近似数据", color: .orange)
+                    }
+                }
+                .font(.caption)
+            }
+        } content: {
+            if let projection {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("预计用满 API USD")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Text(priceText(projection.projectedAPIUSD, projection: projection))
+                            .font(.system(size: 28, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                            .accessibilityLabel("预计用满 \(priceText(projection.projectedAPIUSD, projection: projection))")
+                    }
+
+                    Divider()
+
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.adaptive(minimum: 130), spacing: 18, alignment: .leading)
+                        ],
+                        alignment: .leading,
+                        spacing: 10
+                    ) {
+                        WeeklyLimitMetric(
+                            title: "截至快照 API USD",
+                            value: priceText(projection.currentAPIUSD, projection: projection)
+                        )
+                        WeeklyLimitMetric(
+                            title: "截至快照 Token",
+                            value: observedTokenText(projection)
+                        )
+                        WeeklyLimitMetric(
+                            title: "已用",
+                            value: percentText(projection.snapshot.usedPercent)
+                        )
+                        WeeklyLimitMetric(
+                            title: "100% Token 等价",
+                            value: projectedTokenText(projection.projectedFullTokens)
+                        )
+                        WeeklyLimitMetric(
+                            title: "重置",
+                            value: compactDateTime(projection.snapshot.resetsAt)
+                        )
+                        TimelineView(.periodic(from: .now, by: 60)) { context in
+                            WeeklyLimitMetric(
+                                title: "周期剩余",
+                                value: remainingTimeText(
+                                    until: projection.snapshot.resetsAt,
+                                    now: context.date
+                                )
+                            )
+                        }
+                        WeeklyLimitMetric(
+                            title: "截至",
+                            value: compactDateTime(projection.snapshot.observedAt)
+                        )
+                    }
+
+                    if let firstWarning = projection.warnings.first {
+                        Label {
+                            Text(warningSummary(firstWarning, count: projection.warnings.count))
+                                .lineLimit(2)
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .help(projection.warnings.joined(separator: "\n"))
+                    }
+                }
+                .help(projectionHelp(projection))
+            } else {
+                Label(
+                    "完成新回合或同步当前日期范围后可估算",
+                    systemImage: "clock.arrow.circlepath"
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 5)
             }
         }
+    }
+
+    private func confidenceBadge(_ confidence: WeeklyLimitConfidence) -> some View {
+        let color: Color = switch confidence {
+        case .insufficient, .low: .orange
+        case .medium: .blue
+        case .higher: .green
+        }
+        return badge("置信度：\(confidence.displayName)", color: color)
+    }
+
+    private func badge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.11), in: Capsule())
+            .overlay {
+                Capsule().stroke(color.opacity(0.35), lineWidth: 0.5)
+            }
+    }
+
+    private func priceText(
+        _ amount: Decimal?,
+        projection: WeeklyLimitProjection
+    ) -> String {
+        guard let amount else { return "—" }
+        let prefix = projection.apiUSD.isPartial || projection.apiUSD.isSuppressed
+            ? "部分≈ "
+            : "≈ "
+        return prefix + TrendPriceTooltipFormatter.string(amount, metric: .apiUSD)
+    }
+
+    private func percentText(_ value: Double) -> String {
+        let fraction = value.rounded() == value ? 0 : 1
+        return String(format: "%.*f%%", fraction, value)
+    }
+
+    private func observedTokenText(_ projection: WeeklyLimitProjection) -> String {
+        let prefix = projection.isApproximate ? "≈ " : ""
+        return prefix + TokenFormatter.compact(projection.observedTokens)
+    }
+
+    private func projectedTokenText(_ value: Int64?) -> String {
+        guard let value else { return "—" }
+        return "≈ " + TokenFormatter.compact(value)
+    }
+
+    private func compactDateTime(_ date: Date) -> String {
+        date.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute())
+    }
+
+    private func remainingTimeText(until reset: Date, now: Date) -> String {
+        let interval = reset.timeIntervalSince(now)
+        guard interval > 0 else { return "已到重置时间" }
+
+        let totalMinutes = max(Int(ceil(interval / 60)), 1)
+        let days = totalMinutes / (24 * 60)
+        let hours = totalMinutes % (24 * 60) / 60
+        let minutes = totalMinutes % 60
+        if days > 0 {
+            return hours > 0 ? "\(days) 天 \(hours) 小时" : "\(days) 天"
+        }
+        if hours > 0 {
+            return minutes > 0 ? "\(hours) 小时 \(minutes) 分" : "\(hours) 小时"
+        }
+        return "\(minutes) 分钟"
+    }
+
+    private func limitName(_ projection: WeeklyLimitProjection) -> String {
+        guard let name = projection.snapshot.limitName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty else {
+            return projection.snapshot.limitId
+        }
+        return name
+    }
+
+    private func warningSummary(_ warning: String, count: Int) -> String {
+        guard count > 1 else { return warning }
+        return "\(warning)（另有 \(count - 1) 项提示）"
+    }
+
+    private func projectionHelp(_ projection: WeeklyLimitProjection) -> String {
+        let period = "限额周期：\(compactDateTime(projection.periodStart)) – \(compactDateTime(projection.snapshot.resetsAt))"
+        let source = "限额：\(limitName(projection))（\(projection.snapshot.limitId) / \(projection.snapshot.bucket)）"
+        return [period, source].joined(separator: "\n")
+    }
+}
+
+private struct WeeklyLimitHistoryCard: View {
+    let history: [WeeklyLimitProjection]
+    let computedAt: Date?
+
+    var body: some View {
+        TrendCard(
+            title: "历史周限额（本地近似）",
+            subtitle: "按每个服务端 7 天窗口的最后观测值线性回推；仅覆盖本地已有报告，不是自然周账单。"
+        ) {
+            if let computedAt {
+                Text("本地计算于 \(computedAt, format: .dateTime.hour().minute())")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } content: {
+            if history.isEmpty {
+                Label(
+                    "尚无历史快照；可同步包含过去日期的范围进行近似回填",
+                    systemImage: "calendar.badge.clock"
+                )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 5)
+            } else {
+                ScrollView(.horizontal) {
+                    Grid(alignment: .trailing, horizontalSpacing: 18, verticalSpacing: 8) {
+                        GridRow {
+                            header("周期", alignment: .leading)
+                            header("100% API USD")
+                            header("100% Token 等价")
+                            header("最后观测实际 API USD")
+                            header("最后观测实际 Token")
+                            header("最后观测已用%")
+                            header("观测截止")
+                        }
+
+                        Divider().gridCellColumns(7)
+
+                        ForEach(Array(history.enumerated()), id: \.offset) { _, projection in
+                            GridRow {
+                                HStack(spacing: 5) {
+                                    Text(periodText(projection))
+                                    if projection.isFinalObservationStale {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundStyle(.orange)
+                                    }
+                                }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                value(priceText(projection.projectedAPIUSD, projection: projection))
+                                value(projectedTokenText(projection.projectedFullTokens))
+                                value(priceText(projection.currentAPIUSD, projection: projection))
+                                value(TokenFormatter.compact(projection.observedTokens))
+                                value(percentText(projection.snapshot.usedPercent))
+                                value(compactDateTime(projection.observationCutoff))
+                            }
+                            .help(rowHelp(projection))
+                        }
+                    }
+                    .font(.callout)
+                    .frame(minWidth: 1_120)
+                }
+            }
+        }
+    }
+
+    private func header(_ text: String, alignment: Alignment = .trailing) -> some View {
+        Text(text)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: alignment)
+    }
+
+    private func value(_ text: String) -> some View {
+        Text(text)
+            .monospacedDigit()
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private func priceText(
+        _ amount: Decimal?,
+        projection: WeeklyLimitProjection
+    ) -> String {
+        guard let amount else { return "—" }
+        let prefix = projection.apiUSD.isPartial || projection.apiUSD.isSuppressed
+            ? "部分≈ "
+            : "≈ "
+        return prefix + TrendPriceTooltipFormatter.string(amount, metric: .apiUSD)
+    }
+
+    private func projectedTokenText(_ value: Int64?) -> String {
+        guard let value else { return "—" }
+        return "≈ " + TokenFormatter.compact(value)
+    }
+
+    private func percentText(_ value: Double) -> String {
+        let fraction = value.rounded() == value ? 0 : 1
+        return String(format: "%.*f%%", fraction, value)
+    }
+
+    private func compactDateTime(_ date: Date) -> String {
+        date.formatted(.dateTime.year(.twoDigits).month(.twoDigits).day(.twoDigits).hour().minute())
+    }
+
+    private func periodText(_ projection: WeeklyLimitProjection) -> String {
+        let start = projection.periodStart.formatted(
+            .dateTime.year(.twoDigits).month(.twoDigits).day(.twoDigits)
+        )
+        let end = projection.periodEnd.formatted(
+            .dateTime.year(.twoDigits).month(.twoDigits).day(.twoDigits)
+        )
+        return "\(start) – \(end)"
+    }
+
+    private func rowHelp(_ projection: WeeklyLimitProjection) -> String {
+        var lines = [
+            projection.isCompleted ? "已结束的限额周期" : "尚未结束的限额周期",
+            "最后观测：\(compactDateTime(projection.observationCutoff))"
+        ]
+        if !projection.warnings.isEmpty {
+            lines.append(contentsOf: projection.warnings)
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+private struct WeeklyLimitMetric: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.callout.weight(.medium))
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 }
 

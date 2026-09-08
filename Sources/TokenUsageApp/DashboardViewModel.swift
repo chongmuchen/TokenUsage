@@ -39,6 +39,7 @@ final class DashboardViewModel: ObservableObject {
     @Published var selectedTrendModels: Set<String> = []
     @Published var selectedTrendEfforts: Set<String> = []
     @Published var selectedTrendSpeeds: Set<UsageTrendSpeed> = []
+    @Published private(set) var weeklyLimitOverview: WeeklyLimitOverview?
 
     private let repository = ReportRepository()
     private let titleStore = ThreadTitleStore()
@@ -46,11 +47,13 @@ final class DashboardViewModel: ObservableObject {
     private let bookmarkStore: SecurityScopedBookmarkStore
     private let builder: UsageTreeBuilder
     private let trendAggregator: UsageTrendAggregator
+    private let weeklyLimitEstimator: WeeklyLimitEstimator
     private var monitors: [String: ReportDirectoryMonitor] = [:]
     private var securityScopedURLs: [UUID: URL] = [:]
     private var loadGeneration = 0
     private var lastLoadedReportFingerprint: [ReportDirectoryFingerprint]?
     private var fallbackRefreshTask: Task<Void, Never>?
+    private var weeklyLimitOverviewTask: Task<Void, Never>?
 
     init() {
         let bookmarkStore = SecurityScopedBookmarkStore()
@@ -66,6 +69,7 @@ final class DashboardViewModel: ObservableObject {
         self.bookmarkStore = bookmarkStore
         self.builder = UsageTreeBuilder(catalog: catalog)
         self.trendAggregator = UsageTrendAggregator(catalog: catalog)
+        self.weeklyLimitEstimator = WeeklyLimitEstimator(catalog: catalog)
         self.homes = homes
         self.selectedRoot = homes.first(where: \.isActive)?.rootURL
             ?? homes.first(where: \.isAvailable)?.rootURL
@@ -77,6 +81,7 @@ final class DashboardViewModel: ObservableObject {
 
     deinit {
         fallbackRefreshTask?.cancel()
+        weeklyLimitOverviewTask?.cancel()
         monitors.values.forEach { $0.stop() }
         securityScopedURLs.values.forEach { $0.stopAccessingSecurityScopedResource() }
     }
@@ -321,7 +326,11 @@ final class DashboardViewModel: ObservableObject {
             }.sorted { ($0.time ?? .distantPast) > ($1.time ?? .distantPast) }
 
             guard generation == loadGeneration else { return }
-            reports = winners.values.map(\.report).sorted { $0.generatedAt > $1.generatedAt }
+            let loadedReports = winners.values.map(\.report).sorted { $0.generatedAt > $1.generatedAt }
+            let weeklyReportGroups = grouped.values.map { candidates in
+                candidates.map(\.report).sorted { $0.generatedAt > $1.generatedAt }
+            }
+            reports = loadedReports
             sessions = rows
             loadIssues = issues
             duplicateSessionCount = duplicates
@@ -334,6 +343,54 @@ final class DashboardViewModel: ObservableObject {
                     : "没有启用的 Codex Home。"
             } else {
                 errorMessage = nil
+            }
+            updateWeeklyLimitOverview(reportGroups: weeklyReportGroups, generation: generation)
+        }
+    }
+
+    /// Weekly-limit aggregation intentionally runs once per completed report
+    /// load, outside the main actor. Each Codex Home is estimated separately
+    /// so one account's quota percentage is never paired with another Home's
+    /// Token/API-USD usage. Chart filters never affect these estimates.
+    private func updateWeeklyLimitOverview(
+        reportGroups: [[UsageReport]],
+        generation: Int
+    ) {
+        weeklyLimitOverviewTask?.cancel()
+        let estimator = weeklyLimitEstimator
+        weeklyLimitOverviewTask = Task.detached(priority: .utility) { [weak self] in
+            let now = Date()
+            var overviews: [WeeklyLimitOverview] = []
+            for reports in reportGroups {
+                guard !Task.isCancelled else { return }
+                let candidate = estimator.overview(
+                    reports: reports,
+                    now: now,
+                    historyLimit: WeeklyLimitEstimator.maximumHistoryPeriods
+                )
+                if candidate.current != nil || !candidate.history.isEmpty {
+                    overviews.append(candidate)
+                }
+            }
+            guard !Task.isCancelled else { return }
+            let overview = overviews.max { lhs, rhs in
+                let lhsHasCurrent = lhs.current != nil
+                let rhsHasCurrent = rhs.current != nil
+                if lhsHasCurrent != rhsHasCurrent {
+                    return !lhsHasCurrent && rhsHasCurrent
+                }
+                let lhsDate = lhs.current?.observationCutoff
+                    ?? lhs.history.first?.observationCutoff
+                    ?? .distantPast
+                let rhsDate = rhs.current?.observationCutoff
+                    ?? rhs.history.first?.observationCutoff
+                    ?? .distantPast
+                return lhsDate < rhsDate
+            } ?? WeeklyLimitOverview(current: nil, history: [], computedAt: now)
+            await MainActor.run { [weak self] in
+                guard let self, generation == self.loadGeneration else { return }
+                self.weeklyLimitOverview = overview
+                self.weeklyLimitOverviewTask = nil
             }
         }
     }

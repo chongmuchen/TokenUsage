@@ -400,7 +400,7 @@ func sessionPriceSafetyRules() throws {
     #expect(session.apiPriceEstimate?.amount == Decimal(string: "0.20"))
 }
 
-@Test("Historical sync rebuilds lower-bound, suppressed, legacy, and stale-price reports")
+@Test("Historical sync rebuilds lower-bound, suppressed, legacy, no-limit, and stale-price reports")
 func historicalSyncRefreshPolicy() throws {
     let current = try historicalPolicyReport()
     #expect(!HistoricalReportGenerator.needsRefresh(
@@ -410,6 +410,11 @@ func historicalSyncRefreshPolicy() throws {
     ))
     #expect(HistoricalReportGenerator.needsRefresh(
         report: try historicalPolicyReport(hasUsageSamples: false),
+        expectedRootID: "session-root",
+        currentCatalogID: "current-catalog"
+    ))
+    #expect(HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(hasRateLimitSnapshots: false),
         expectedRootID: "session-root",
         currentCatalogID: "current-catalog"
     ))
@@ -619,6 +624,7 @@ private func makeSyntheticReportData(
 
 private func historicalPolicyReport(
     hasUsageSamples: Bool = true,
+    hasRateLimitSnapshots: Bool = true,
     isLowerBound: Bool = false,
     costSuppressed: Bool = false,
     reportCatalogID: String = "current-catalog",
@@ -632,6 +638,11 @@ private func historicalPolicyReport(
         task["usage_samples"] = []
     } else {
         task.removeValue(forKey: "usage_samples")
+    }
+    if hasRateLimitSnapshots {
+        object["rate_limit_snapshots"] = []
+    } else {
+        object.removeValue(forKey: "rate_limit_snapshots")
     }
     task["usage_is_lower_bound"] = isLowerBound
     task["cost"] = [

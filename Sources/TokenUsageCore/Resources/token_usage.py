@@ -32,7 +32,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 
-CACHE_SCHEMA_VERSION = 11
+CACHE_SCHEMA_VERSION = 13
 CHECKPOINT_BYTES = 4096
 REPORT_SCHEMA_VERSION = 1
 PROMPT_PREVIEW_CHARACTERS = 240
@@ -224,6 +224,139 @@ def _iso_to_epoch(value: Any) -> Optional[float]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _utc_iso(value: Any) -> Optional[str]:
+    if isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            parsed = datetime.fromtimestamp(float(value), timezone.utc)
+        elif isinstance(value, str) and value:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                parsed = datetime.fromtimestamp(float(value), timezone.utc)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+        else:
+            return None
+    except (OSError, OverflowError, ValueError):
+        return None
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+def _rate_limit_snapshot_key(value: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    return value.get("limit_id"), value.get("bucket"), value.get("window_minutes")
+
+
+def _same_rate_limit_period(lhs: Dict[str, Any], rhs: Dict[str, Any]) -> bool:
+    if _rate_limit_snapshot_key(lhs) != _rate_limit_snapshot_key(rhs):
+        return False
+    lhs_reset = _iso_to_epoch(lhs.get("resets_at"))
+    rhs_reset = _iso_to_epoch(rhs.get("resets_at"))
+    if lhs_reset is None or rhs_reset is None:
+        return lhs.get("resets_at") == rhs.get("resets_at")
+    return lhs_reset == rhs_reset
+
+
+def _add_rate_limit_snapshot(
+    container: List[Dict[str, Any]], candidate: Dict[str, Any]
+) -> None:
+    for index in range(len(container) - 1, -1, -1):
+        existing = container[index]
+        if not _same_rate_limit_period(existing, candidate):
+            continue
+        existing_epoch = _iso_to_epoch(existing.get("observed_at"))
+        candidate_epoch = _iso_to_epoch(candidate.get("observed_at"))
+        if existing_epoch is None or (
+            candidate_epoch is not None and candidate_epoch >= existing_epoch
+        ):
+            container[index] = candidate
+        return
+    container.append(candidate)
+
+
+def _capture_rate_limit_snapshots(
+    state: Dict[str, Any], payload: Dict[str, Any], timestamp: Any
+) -> None:
+    rate_limits = payload.get("rate_limits")
+    observed_at = _utc_iso(timestamp)
+    if not isinstance(rate_limits, dict) or observed_at is None:
+        return
+
+    shared_limit_id = rate_limits.get("limit_id")
+    shared_limit_name = rate_limits.get("limit_name")
+    shared_plan_type = rate_limits.get("plan_type")
+    container = state.setdefault("rate_limit_snapshots", [])
+
+    for bucket in ("primary", "secondary"):
+        bucket_value = rate_limits.get(bucket)
+        if not isinstance(bucket_value, dict):
+            continue
+        used_percent = bucket_value.get("used_percent")
+        if isinstance(used_percent, bool) or not isinstance(used_percent, (int, float)):
+            continue
+        try:
+            if not Decimal(str(used_percent)).is_finite():
+                continue
+        except InvalidOperation:
+            continue
+        window_minutes = _as_int(bucket_value.get("window_minutes"))
+        resets_at = _utc_iso(bucket_value.get("resets_at"))
+        if not window_minutes or resets_at is None:
+            continue
+
+        limit_id = bucket_value.get("limit_id")
+        if not isinstance(limit_id, str) or not limit_id:
+            limit_id = shared_limit_id
+        if not isinstance(limit_id, str) or not limit_id:
+            continue
+        limit_name = bucket_value.get("limit_name")
+        if not isinstance(limit_name, str) or not limit_name:
+            limit_name = shared_limit_name
+        plan_type = bucket_value.get("plan_type")
+        if not isinstance(plan_type, str) or not plan_type:
+            plan_type = shared_plan_type
+        candidate: Dict[str, Any] = {
+            "observed_at": observed_at,
+            "limit_id": limit_id,
+            "bucket": bucket,
+            "used_percent": used_percent,
+            "window_minutes": window_minutes,
+            "resets_at": resets_at,
+        }
+        if isinstance(limit_name, str) and limit_name:
+            candidate["limit_name"] = limit_name
+        if isinstance(plan_type, str) and plan_type:
+            candidate["plan_type"] = plan_type
+        _add_rate_limit_snapshot(container, candidate)
+
+
+def _merge_rate_limit_snapshots(
+    values: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    candidates = [dict(value) for value in values if isinstance(value, dict)]
+    candidates.sort(
+        key=lambda value: (
+            str(value.get("observed_at") or ""),
+            str(value.get("limit_id") or ""),
+            str(value.get("bucket") or ""),
+        )
+    )
+    result: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        _add_rate_limit_snapshot(result, candidate)
+    result.sort(
+        key=lambda value: (
+            str(value.get("observed_at") or ""),
+            str(value.get("limit_id") or ""),
+            str(value.get("bucket") or ""),
+        )
+    )
+    return result
 
 
 def _request_heading_body(line: str) -> Optional[str]:
@@ -467,6 +600,7 @@ def _new_parser_state(transcript_path: Path, stat_result: os.stat_result) -> Dic
         "image_generation_details": [],
         "unattributed_segments": [],
         "usage_samples": [],
+        "rate_limit_snapshots": [],
         "unattributed_counts": _zero_counts(),
         "last_event_at": None,
         "parse_errors": 0,
@@ -812,6 +946,7 @@ def _process_record(state: Dict[str, Any], record: Dict[str, Any]) -> None:
         return
 
     if event_type == "token_count":
+        _capture_rate_limit_snapshots(state, payload, timestamp)
         info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
         total_value = info.get("total_token_usage")
         if not isinstance(total_value, dict):
@@ -1396,6 +1531,7 @@ def _thread_summary(
         # serialized so the report contains one, and only one, timeline copy.
         "_usage_samples": owned_samples,
         "_image_generations": owned_image_generations,
+        "_rate_limit_snapshots": list(state.get("rate_limit_snapshots") or []),
         "warnings": list(dict.fromkeys(warnings)),
         "parse_errors": _as_int(state.get("parse_errors")),
         "unclassified_compaction_total": _as_int(state.get("unclassified_compaction_total")),
@@ -1912,12 +2048,18 @@ def build_report(
             str(detail.get("id") or ""),
         )
     )
+    task_rate_limit_snapshots = _merge_rate_limit_snapshots(
+        snapshot
+        for summary in summaries.values()
+        for snapshot in (summary.get("_rate_limit_snapshots") or [])
+    )
     # Do not serialize minute samples beneath thread/turn breakdowns. Those
     # structures intentionally repeat accounting views and would invite double
     # counting by consumers.
     for summary in summaries.values():
         summary.pop("_usage_samples", None)
         summary.pop("_image_generations", None)
+        summary.pop("_rate_limit_snapshots", None)
 
     catalog = _load_catalog()
     report_warnings = list(graph_warnings)
@@ -1981,6 +2123,7 @@ def build_report(
         "root_thread_id": root_id,
         "selected_turn_id": turn_id,
         "image_generations": task_image_generations,
+        "rate_limit_snapshots": task_rate_limit_snapshots,
         "current_turn": {
             "available": selected_turn is not None,
             "usage_is_provisional": current_provisional,

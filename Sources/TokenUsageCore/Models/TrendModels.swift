@@ -5,6 +5,11 @@ import Foundation
 /// report generation minute as an explicitly approximate fallback.
 public struct UsageSample: Codable, Equatable, Hashable, Sendable {
     public let minute: Date?
+    /// Optional ownership metadata emitted by newer producers. Keeping it on
+    /// the task-level timeline lets detail views slice the exact same samples
+    /// as the trend view without duplicating an accounting plane.
+    public let threadId: String?
+    public let turnId: String?
     public let model: String?
     public let effort: String?
     public let tier: String?
@@ -16,6 +21,8 @@ public struct UsageSample: Codable, Equatable, Hashable, Sendable {
 
     public init(
         minute: Date?,
+        threadId: String? = nil,
+        turnId: String? = nil,
         model: String? = nil,
         effort: String? = nil,
         tier: String? = nil,
@@ -26,6 +33,8 @@ public struct UsageSample: Codable, Equatable, Hashable, Sendable {
         requestCount: Int64? = nil
     ) {
         self.minute = minute
+        self.threadId = threadId
+        self.turnId = turnId
         self.model = model
         self.effort = effort
         self.tier = tier

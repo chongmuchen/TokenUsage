@@ -14,7 +14,7 @@ public struct UsageTreeBuilder: Sendable {
     }
 
     /// Builds one non-expandable footer row from the already-filtered top-level
-    /// sessions. Only each session's authoritative task total is included, so
+    /// sessions. Only each session's displayed subtree total is included, so
     /// expanded child rows are never counted a second time.
     public func summaryRow(for sessions: [UsageTreeRow]) -> UsageTreeRow? {
         let topLevel = sessions.filter { $0.kind == .session }
@@ -50,7 +50,92 @@ public struct UsageTreeBuilder: Sendable {
             attribution: .direct,
             isProvisional: topLevel.contains(where: \.isProvisional),
             isLowerBound: topLevel.contains(where: \.isLowerBound),
+            isUsageApproximate: topLevel.contains(where: \.isUsageApproximate),
+            isOwnUsageApproximate: topLevel.contains(where: \.isOwnUsageApproximate),
+            pricingSuppressed: topLevel.allSatisfy(\.pricingSuppressed),
             warnings: warnings
+        )
+    }
+
+    /// Projects a full-session row tree onto the same half-open minute range
+    /// used by `UsageTrendAggregator`. Exact samples are preferred; legacy
+    /// rows fall back to their segment observation times and are marked as
+    /// approximate. Rows with no selected Token are omitted.
+    public func slicedRow(
+        _ row: UsageTreeRow,
+        lower: Date,
+        upperExclusive: Date
+    ) -> UsageTreeRow? {
+        guard lower < upperExclusive else { return nil }
+
+        let own = slicePlane(
+            samples: row.ownUsageSamples,
+            segments: row.ownSegments,
+            fallbackUsage: row.ownUsage,
+            fallbackTime: row.usageSampleFallbackTime ?? row.endTime ?? row.time,
+            lower: lower,
+            upperExclusive: upperExclusive
+        )
+        let subtree = slicePlane(
+            samples: row.subtreeUsageSamples,
+            segments: row.segments,
+            fallbackUsage: row.subtreeUsage,
+            fallbackTime: row.usageSampleFallbackTime ?? row.endTime ?? row.time,
+            lower: lower,
+            upperExclusive: upperExclusive
+        )
+        guard !subtree.usage.isZero else { return nil }
+
+        let children = row.children?.compactMap {
+            slicedRow($0, lower: lower, upperExclusive: upperExclusive)
+        }
+        let approximate = own.approximate || subtree.approximate
+        var warnings = row.warnings
+        if approximate {
+            let warning = "该行缺少完整的分钟归属数据；时段内 Token 已按用量观测时间近似计算。"
+            if !warnings.contains(warning) { warnings.append(warning) }
+        }
+        if
+            subtree.samples != nil,
+            children?.contains(where: { $0.isUsageApproximate || $0.isOwnUsageApproximate }) == true
+        {
+            let warning = "该行总量来自精确分钟样本；部分展开项为旧数据近似，明细之和可能不与总量完全一致。"
+            if !warnings.contains(warning) { warnings.append(warning) }
+        }
+        let credit = row.pricingSuppressed
+            ? nil
+            : estimator.estimate(subtree.segments, expectedTotalTokens: subtree.usage.totalTokens)
+        let apiPrice = row.pricingSuppressed
+            ? nil
+            : estimator.estimateAPI(subtree.segments, expectedTotalTokens: subtree.usage.totalTokens)
+
+        return UsageTreeRow(
+            id: row.id,
+            kind: row.kind,
+            time: row.time,
+            endTime: row.endTime,
+            name: row.name,
+            ownUsage: own.usage,
+            subtreeUsage: subtree.usage,
+            counts: row.counts,
+            imageGenerations: row.imageGenerations,
+            segments: subtree.segments,
+            ownSegments: own.segments,
+            ownUsageSamples: own.samples,
+            subtreeUsageSamples: subtree.samples,
+            usageSampleFallbackTime: row.usageSampleFallbackTime,
+            modelSummary: estimator.modelSummary(for: subtree.segments),
+            creditEstimate: credit,
+            apiPriceEstimate: apiPrice,
+            apiUSDText: nil,
+            attribution: row.attribution,
+            isProvisional: row.isProvisional,
+            isLowerBound: row.isLowerBound,
+            isUsageApproximate: subtree.approximate,
+            isOwnUsageApproximate: own.approximate,
+            pricingSuppressed: row.pricingSuppressed,
+            warnings: warnings,
+            children: children
         )
     }
 
@@ -115,6 +200,71 @@ public struct UsageTreeBuilder: Sendable {
             }
         }
 
+        let taskSamples = report.task.usageSamples
+
+        func reconciledSamples(_ samples: [UsageSample], expected: TokenUsage) -> [UsageSample]? {
+            TokenUsage.sum(samples.map(\.usage)) == expected ? samples : nil
+        }
+
+        func ownSamples(threadID: String, expected: TokenUsage) -> [UsageSample]? {
+            guard let taskSamples else { return nil }
+            return reconciledSamples(
+                taskSamples.filter { $0.threadId == threadID },
+                expected: expected
+            )
+        }
+
+        func ownSamples(threadID: String, turnID: String, expected: TokenUsage) -> [UsageSample]? {
+            guard let taskSamples else { return nil }
+            return reconciledSamples(
+                taskSamples.filter { $0.threadId == threadID && $0.turnId == turnID },
+                expected: expected
+            )
+        }
+
+        func descendantThreadIDs(startingWith roots: [String]) -> Set<String> {
+            var result = Set<String>()
+            var pending = roots
+            while let current = pending.popLast() {
+                guard result.insert(current).inserted else { continue }
+                pending.append(contentsOf: ownerByChild.compactMap { childID, owner in
+                    owner.parentThreadID == current ? childID : nil
+                })
+            }
+            return result
+        }
+
+        func subtreeSamples(
+            threadID: String,
+            turnID: String? = nil,
+            descendantRoots: [String],
+            expected: TokenUsage
+        ) -> [UsageSample]? {
+            guard let taskSamples else { return nil }
+            let descendants = descendantThreadIDs(startingWith: descendantRoots)
+            let selected = taskSamples.filter { sample in
+                if let ownerThreadID = sample.threadId, descendants.contains(ownerThreadID) {
+                    return true
+                }
+                guard sample.threadId == threadID else { return false }
+                return turnID == nil || sample.turnId == turnID
+            }
+            return reconciledSamples(selected, expected: expected)
+        }
+
+        func residualSamples(thread: ThreadSummary, expected: TokenUsage) -> [UsageSample]? {
+            guard let taskSamples else { return nil }
+            let knownTurnIDs = Set(thread.turns.map(\.turnId))
+            return reconciledSamples(
+                taskSamples.filter { sample in
+                    guard sample.threadId == thread.threadId else { return false }
+                    guard let turnID = sample.turnId else { return true }
+                    return !knownTurnIDs.contains(turnID)
+                },
+                expected: expected
+            )
+        }
+
         var renderedThreadIDs = Set<String>()
 
         func detailBelongsToThread(_ detail: ImageGenerationDetail, threadID: String) -> Bool {
@@ -168,20 +318,39 @@ public struct UsageTreeBuilder: Sendable {
             let childCounts = UsageCounts.sum(childRows.map(\.counts))
             let childImageGenerations = childRows.flatMap(\.imageGenerations)
             let subtreeSegments = turn.segments + childRows.flatMap(\.segments)
+            let childThreadRoots = childThreadIDs(
+                parentThreadID: thread.threadId,
+                parentTurnID: turn.turnId
+            )
+            let subtreeUsage = turn.usage + childUsage
             let rowAttribution: AttributionKind = main ? .direct : .direct
             return makeRow(
                 id: "turn:\(thread.threadId):\(turn.turnId)",
                 kind: main ? .mainTurn : .agentTurn,
                 time: turn.effectiveStart,
+                endTime: turn.effectiveEnd,
                 name: main ? "主对话 \(ordinal + 1)" : "代理轮次 \(ordinal + 1)",
                 ownUsage: turn.usage,
-                subtreeUsage: turn.usage + childUsage,
+                subtreeUsage: subtreeUsage,
                 counts: turn.counts + childCounts,
                 imageGenerations: imageGenerations(
                     threadID: thread.threadId,
                     turnID: turn.turnId
                 ) + childImageGenerations,
                 segments: subtreeSegments,
+                ownSegments: turn.segments,
+                ownUsageSamples: ownSamples(
+                    threadID: thread.threadId,
+                    turnID: turn.turnId,
+                    expected: turn.usage
+                ),
+                subtreeUsageSamples: subtreeSamples(
+                    threadID: thread.threadId,
+                    turnID: turn.turnId,
+                    descendantRoots: childThreadRoots,
+                    expected: subtreeUsage
+                ),
+                usageSampleFallbackTime: report.generatedAt,
                 attribution: rowAttribution,
                 pricingSuppressed: pricingSuppressed,
                 isProvisional: turn.completedAt == nil && !turn.aborted,
@@ -215,13 +384,18 @@ public struct UsageTreeBuilder: Sendable {
                     makeRow(
                         id: "residual:\(threadID)",
                         kind: .residual,
-                        time: nil,
+                        time: interval(for: thread)?.end,
+                        endTime: interval(for: thread)?.end,
                         name: "线程内未归属用量",
                         ownUsage: residualUsage,
                         subtreeUsage: residualUsage,
                         counts: residualCounts,
                         imageGenerations: unmatchedImageGenerations(thread: thread),
                         segments: [],
+                        ownSegments: [],
+                        ownUsageSamples: residualSamples(thread: thread, expected: residualUsage),
+                        subtreeUsageSamples: residualSamples(thread: thread, expected: residualUsage),
+                        usageSampleFallbackTime: report.generatedAt,
                         attribution: .unattributed,
                         pricingSuppressed: pricingSuppressed,
                         warnings: ["该用量无法归到具体代理轮次"]
@@ -236,6 +410,10 @@ public struct UsageTreeBuilder: Sendable {
             let descendantCounts = UsageCounts.sum(descendantRows.map(\.counts))
             let descendantImageGenerations = descendantRows.flatMap(\.imageGenerations)
             let descendantSegments = descendantRows.flatMap(\.segments)
+            let directChildThreadIDs = ownerByChild.compactMap { childID, owner in
+                owner.parentThreadID == threadID ? childID : nil
+            }
+            let subtreeUsage = thread.usage + descendantUsage
             let owner = ownerByChild[threadID]
             let attribution = owner?.attribution ?? .unattributed
             let labelPrefix = attribution == .unattributed ? "侧边对话" : "子对话"
@@ -244,13 +422,22 @@ public struct UsageTreeBuilder: Sendable {
                 id: "thread:\(threadID)",
                 kind: .agentThread,
                 time: interval(for: thread)?.start,
+                endTime: interval(for: thread)?.end,
                 name: "\(labelPrefix) · \(threadLabel(thread))",
                 ownUsage: thread.usage,
-                subtreeUsage: thread.usage + descendantUsage,
+                subtreeUsage: subtreeUsage,
                 counts: thread.counts + descendantCounts,
                 imageGenerations: ownThreadImageGenerations(threadID: threadID)
                     + descendantImageGenerations,
                 segments: thread.segments + descendantSegments,
+                ownSegments: thread.segments,
+                ownUsageSamples: ownSamples(threadID: threadID, expected: thread.usage),
+                subtreeUsageSamples: subtreeSamples(
+                    threadID: threadID,
+                    descendantRoots: directChildThreadIDs,
+                    expected: subtreeUsage
+                ),
+                usageSampleFallbackTime: report.generatedAt,
                 attribution: attribution,
                 pricingSuppressed: pricingSuppressed,
                 isProvisional: thread.activeTurnCount > 0,
@@ -275,13 +462,18 @@ public struct UsageTreeBuilder: Sendable {
                     makeRow(
                         id: "residual:\(root.threadId)",
                         kind: .residual,
-                        time: nil,
+                        time: interval(for: root)?.end,
+                        endTime: interval(for: root)?.end,
                         name: "主线程未归属用量",
                         ownUsage: residualUsage,
                         subtreeUsage: residualUsage,
                         counts: residualCounts,
                         imageGenerations: unmatchedImageGenerations(thread: root),
                         segments: [],
+                        ownSegments: [],
+                        ownUsageSamples: residualSamples(thread: root, expected: residualUsage),
+                        subtreeUsageSamples: residualSamples(thread: root, expected: residualUsage),
+                        usageSampleFallbackTime: report.generatedAt,
                         attribution: .unattributed,
                         pricingSuppressed: pricingSuppressed,
                         warnings: ["该用量无法归到具体主对话"]
@@ -307,17 +499,28 @@ public struct UsageTreeBuilder: Sendable {
             let sideCounts = UsageCounts.sum(sideRows.map(\.counts))
             let sideImageGenerations = sideRows.flatMap(\.imageGenerations)
             let sideSegments = sideRows.flatMap(\.segments)
+            let sideSamples: [UsageSample]? = sideRows.allSatisfy { $0.subtreeUsageSamples != nil }
+                ? reconciledSamples(
+                    sideRows.flatMap { $0.subtreeUsageSamples ?? [] },
+                    expected: sideUsage
+                )
+                : nil
             rootTurnRows.append(
                 makeRow(
                     id: "side-group:\(report.rootThreadId)",
                     kind: .sideGroup,
                     time: sideRows.compactMap(\.time).min(),
+                    endTime: sideRows.compactMap(\.endTime).max(),
                     name: "侧边 / 无法唯一归属的对话",
                     ownUsage: .zero,
                     subtreeUsage: sideUsage,
                     counts: sideCounts,
                     imageGenerations: sideImageGenerations,
                     segments: sideSegments,
+                    ownSegments: [],
+                    ownUsageSamples: taskSamples == nil ? nil : [],
+                    subtreeUsageSamples: sideSamples,
+                    usageSampleFallbackTime: report.generatedAt,
                     attribution: .unattributed,
                     pricingSuppressed: pricingSuppressed,
                     warnings: ["这些对话没有唯一的主轮次归属"],
@@ -338,7 +541,21 @@ public struct UsageTreeBuilder: Sendable {
         if threadTotal != report.task.usage {
             sessionWarnings.append("任务汇总与线程独占用量之和不一致；表格以任务汇总为准。")
         }
-        let sessionStart = root.flatMap { orderedTurns($0).compactMap(\.effectiveStart).min() } ?? report.generatedAt
+        let threadIntervals = report.threads.compactMap(interval(for:))
+        let sampleTimes = report.task.usageSamples?.compactMap(\.minute) ?? []
+        let segmentStarts = report.task.segments.compactMap { $0.firstAt ?? $0.lastAt }
+        let segmentEnds = report.task.segments.compactMap { $0.lastAt ?? $0.firstAt }
+        let sessionStart: Date
+        let sessionEnd: Date
+        let observedStarts = threadIntervals.map(\.start) + sampleTimes + segmentStarts
+        let observedEnds = threadIntervals.map(\.end) + sampleTimes + segmentEnds
+        if let start = observedStarts.min(), let end = observedEnds.max() {
+            sessionStart = start
+            sessionEnd = max(start, end)
+        } else {
+            sessionStart = report.generatedAt
+            sessionEnd = report.generatedAt
+        }
         let pricingSegments = sessionPricingSegments(for: report.task)
         let estimatedCredit = estimator.estimate(
             pricingSegments,
@@ -371,6 +588,7 @@ public struct UsageTreeBuilder: Sendable {
             id: "session:\(report.rootThreadId)",
             kind: .session,
             time: sessionStart,
+            endTime: sessionEnd,
             name: title?.nonEmpty
                 ?? report.displayName?.nonEmpty
                 ?? "会话 \(shortID(report.rootThreadId))",
@@ -379,12 +597,20 @@ public struct UsageTreeBuilder: Sendable {
             counts: report.task.counts,
             imageGenerations: reportImageGenerations,
             segments: report.task.segments,
+            ownSegments: root?.segments ?? [],
+            ownUsageSamples: ownSamples(
+                threadID: report.rootThreadId,
+                expected: report.task.rootUsage
+            ),
+            subtreeUsageSamples: report.task.usageSamples,
+            usageSampleFallbackTime: report.generatedAt,
             modelSummary: estimator.modelSummary(for: report.task.segments),
             creditEstimate: sessionCredit,
             apiPriceEstimate: sessionAPIPrice,
             apiUSDText: report.task.cost.preferredAPIUSDText,
             attribution: .direct,
             isLowerBound: report.task.usageIsLowerBound,
+            pricingSuppressed: pricingSuppressed,
             warnings: sessionWarnings,
             children: rootTurnRows
         )
@@ -394,12 +620,17 @@ public struct UsageTreeBuilder: Sendable {
         id: String,
         kind: UsageRowKind,
         time: Date?,
+        endTime: Date? = nil,
         name: String,
         ownUsage: TokenUsage,
         subtreeUsage: TokenUsage,
         counts: UsageCounts,
         imageGenerations: [ImageGenerationDetail] = [],
         segments: [UsageSegment],
+        ownSegments: [UsageSegment]? = nil,
+        ownUsageSamples: [UsageSample]? = nil,
+        subtreeUsageSamples: [UsageSample]? = nil,
+        usageSampleFallbackTime: Date? = nil,
         attribution: AttributionKind,
         pricingSuppressed: Bool,
         isProvisional: Bool = false,
@@ -411,12 +642,17 @@ public struct UsageTreeBuilder: Sendable {
             id: id,
             kind: kind,
             time: time,
+            endTime: endTime,
             name: name,
             ownUsage: ownUsage,
             subtreeUsage: subtreeUsage,
             counts: counts,
             imageGenerations: imageGenerations,
             segments: segments,
+            ownSegments: ownSegments,
+            ownUsageSamples: ownUsageSamples,
+            subtreeUsageSamples: subtreeUsageSamples,
+            usageSampleFallbackTime: usageSampleFallbackTime,
             modelSummary: estimator.modelSummary(for: segments),
             creditEstimate: pricingSuppressed
                 ? nil
@@ -427,6 +663,7 @@ public struct UsageTreeBuilder: Sendable {
             attribution: attribution,
             isProvisional: isProvisional,
             isLowerBound: isLowerBound,
+            pricingSuppressed: pricingSuppressed,
             warnings: warnings,
             children: children
         )
@@ -509,6 +746,84 @@ public struct UsageTreeBuilder: Sendable {
                 requestCount: sample.requestCount
             )
         }
+    }
+
+    private func slicePlane(
+        samples: [UsageSample]?,
+        segments: [UsageSegment],
+        fallbackUsage: TokenUsage,
+        fallbackTime: Date?,
+        lower: Date,
+        upperExclusive: Date
+    ) -> SlicedUsagePlane {
+        if let samples {
+            let selected = samples.filter { sample in
+                guard let at = sample.minute ?? fallbackTime else { return false }
+                return at >= lower && at < upperExclusive
+            }
+            return SlicedUsagePlane(
+                usage: TokenUsage.sum(selected.map(\.usage)),
+                segments: selected.map(segment(for:)),
+                samples: selected,
+                approximate: samples.contains { $0.minute == nil }
+            )
+        }
+
+        if !segments.isEmpty {
+            let selected = segments.filter { segment in
+                guard let at = segment.lastAt ?? segment.firstAt ?? fallbackTime else { return false }
+                return at >= lower && at < upperExclusive
+            }
+            return SlicedUsagePlane(
+                usage: TokenUsage.sum(selected.map(\.usage)),
+                segments: selected,
+                samples: nil,
+                approximate: true
+            )
+        }
+
+        guard
+            !fallbackUsage.isZero,
+            let fallbackTime,
+            fallbackTime >= lower,
+            fallbackTime < upperExclusive
+        else {
+            return SlicedUsagePlane(usage: .zero, segments: [], samples: nil, approximate: true)
+        }
+        return SlicedUsagePlane(
+            usage: fallbackUsage,
+            segments: [
+                UsageSegment(
+                    model: nil,
+                    effort: nil,
+                    tier: nil,
+                    tierSource: nil,
+                    taskEpoch: nil,
+                    longContext: nil,
+                    usage: fallbackUsage,
+                    firstAt: fallbackTime,
+                    lastAt: fallbackTime,
+                    requestCount: nil
+                )
+            ],
+            samples: nil,
+            approximate: true
+        )
+    }
+
+    private func segment(for sample: UsageSample) -> UsageSegment {
+        UsageSegment(
+            model: sample.model,
+            effort: sample.effort,
+            tier: sample.tier,
+            tierSource: sample.tierSource,
+            taskEpoch: sample.taskEpoch,
+            longContext: sample.longContext,
+            usage: sample.usage,
+            firstAt: sample.minute,
+            lastAt: sample.minute,
+            requestCount: sample.requestCount
+        )
     }
 
     /// Embedded report prices remain a compatibility fallback for legacy
@@ -694,6 +1009,13 @@ private struct Owner: Hashable {
     let parentThreadID: String
     let parentTurnID: String
     let attribution: AttributionKind
+}
+
+private struct SlicedUsagePlane {
+    let usage: TokenUsage
+    let segments: [UsageSegment]
+    let samples: [UsageSample]?
+    let approximate: Bool
 }
 
 private extension Optional where Wrapped == String {

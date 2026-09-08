@@ -43,10 +43,20 @@ struct FilterBar: View {
             .fixedSize()
 
             if showsTokenRange {
+                Picker("Token 口径", selection: $viewModel.filter.tokenScope) {
+                    Text("会话总量").tag(UsageTokenScope.sessionTotal)
+                    Text("时段用量").tag(UsageTokenScope.selectedRange)
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .fixedSize()
+                .accessibilityLabel("会话 Token 口径")
+                .help("会话总量显示完整会话用量；时段用量按 token_count 的观测分钟统计筛选时间段内的用量。")
+
                 Divider().frame(height: 24)
 
                 HStack(spacing: 6) {
-                    Text("Token 总数")
+                    Text(tokenRangeLabel)
                         .foregroundStyle(.secondary)
                     TextField("最少，如 100k", text: $viewModel.filter.minimumTokensText)
                         .textFieldStyle(.roundedBorder)
@@ -85,6 +95,15 @@ struct FilterBar: View {
                 viewModel.markDateRangeCustom()
             }
         )
+    }
+
+    private var tokenRangeLabel: String {
+        switch viewModel.filter.tokenScope {
+        case .sessionTotal:
+            "会话总量范围"
+        case .selectedRange:
+            "时段用量范围"
+        }
     }
 }
 

@@ -176,6 +176,90 @@ func tokenBounds() {
     #expect(filter.minimumTokens == nil)
 }
 
+@Test("Session date overlap and token bounds are independent filters")
+func sessionDateOverlapAndTokenBounds() throws {
+    let calendar = utcCalendar()
+    let selectedMinute = try testTimestamp("2026-03-15T10:00:30Z")
+    let usage = TokenUsage(inputTokens: 100, outputTokens: 20)
+    let overlapping = UsageTreeRow(
+        id: "session:overlapping",
+        kind: .session,
+        time: try testTimestamp("2026-03-15T09:55:00Z"),
+        endTime: try testTimestamp("2026-03-15T10:00:30Z"),
+        name: "Overlapping",
+        ownUsage: usage,
+        subtreeUsage: usage,
+        counts: .zero,
+        segments: [],
+        modelSummary: "—",
+        creditEstimate: nil,
+        attribution: .direct
+    )
+    let endedBefore = UsageTreeRow(
+        id: "session:ended-before",
+        kind: .session,
+        time: try testTimestamp("2026-03-15T09:55:00Z"),
+        endTime: try testTimestamp("2026-03-15T09:59:59Z"),
+        name: "Ended Before",
+        ownUsage: usage,
+        subtreeUsage: usage,
+        counts: .zero,
+        segments: [],
+        modelSummary: "—",
+        creditEstimate: nil,
+        attribution: .direct
+    )
+    let endsAtLowerBoundary = UsageTreeRow(
+        id: "session:ends-at-lower",
+        kind: .session,
+        time: try testTimestamp("2026-03-15T09:55:00Z"),
+        endTime: try testTimestamp("2026-03-15T10:00:00Z"),
+        name: "Ends At Lower Boundary",
+        ownUsage: usage,
+        subtreeUsage: usage,
+        counts: .zero,
+        segments: [],
+        modelSummary: "—",
+        creditEstimate: nil,
+        attribution: .direct
+    )
+    let startsAtUpperBoundary = UsageTreeRow(
+        id: "session:starts-at-upper",
+        kind: .session,
+        time: try testTimestamp("2026-03-15T10:01:00Z"),
+        endTime: try testTimestamp("2026-03-15T10:02:00Z"),
+        name: "Starts At Upper Boundary",
+        ownUsage: usage,
+        subtreeUsage: usage,
+        counts: .zero,
+        segments: [],
+        modelSummary: "—",
+        creditEstimate: nil,
+        attribution: .direct
+    )
+
+    var filter = UsageFilter(now: selectedMinute, calendar: calendar)
+    // Reversed picker values still normalize to the complete selected minute.
+    filter.startDate = try testTimestamp("2026-03-15T10:00:59Z")
+    filter.endDate = try testTimestamp("2026-03-15T10:00:01Z")
+
+    #expect(filter.overlapsDateRange(overlapping, calendar: calendar))
+    #expect(!filter.overlapsDateRange(endedBefore, calendar: calendar))
+    #expect(filter.overlapsDateRange(endsAtLowerBoundary, calendar: calendar))
+    #expect(!filter.overlapsDateRange(startsAtUpperBoundary, calendar: calendar))
+
+    filter.minimumTokensText = "120"
+    filter.maximumTokensText = "120"
+    #expect(filter.includesTokenBounds(overlapping))
+    #expect(filter.includes(overlapping, calendar: calendar))
+
+    filter.minimumTokensText = "121"
+    filter.maximumTokensText = ""
+    #expect(filter.overlapsDateRange(overlapping, calendar: calendar))
+    #expect(!filter.includesTokenBounds(overlapping))
+    #expect(!filter.includes(overlapping, calendar: calendar))
+}
+
 @Test("Session titles remove attached-file metadata and keep the actual request")
 func attachmentMetadataIsNotUsedAsTitle() {
     let wrapped = """
@@ -245,6 +329,17 @@ func treeAttributionAndAccounting() throws {
     #expect(inferred.attribution == .timeInferred)
     #expect(side.attribution == .unattributed)
 
+    // The session interval covers activity in every linked thread, including
+    // a side agent that outlives the root turn.
+    let expectedSessionStart = try testTimestamp("2026-01-10T12:00:00Z")
+    let expectedSideEnd = try testTimestamp("2026-01-10T13:00:10Z")
+    let expectedSessionEnd = expectedSideEnd.addingTimeInterval(0.125)
+    let expectedMainEnd = try testTimestamp("2026-01-10T12:01:00Z")
+    #expect(session.time == expectedSessionStart)
+    #expect(session.endTime == expectedSessionEnd)
+    #expect(main.endTime == expectedMainEnd)
+    #expect(side.endTime == expectedSideEnd)
+
     #expect(session.ownUsage.totalTokens == 120)
     #expect(session.subtreeUsage.totalTokens == 190)
     #expect(main.ownUsage.totalTokens == 120)
@@ -268,6 +363,193 @@ func treeAttributionAndAccounting() throws {
     #expect(ids.filter { $0 == "thread:agent-direct" }.count == 1)
     #expect(ids.filter { $0 == "thread:agent-inferred" }.count == 1)
     #expect(ids.filter { $0 == "thread:agent-side" }.count == 1)
+}
+
+@Test("Exact minute slicing preserves attributed rollups, drops zero branches, and reprices")
+func exactMinuteSliceRollupAndPricing() throws {
+    let report = try attributedSyntheticReport()
+    let catalog = try PricingCatalog.bundled()
+    let builder = UsageTreeBuilder(catalog: catalog)
+    let fullSession = builder.build(report: report, title: "Attributed")
+    let lower = try testTimestamp("2026-01-10T12:00:00Z")
+    let upper = try testTimestamp("2026-01-10T12:01:00Z")
+
+    let sliced = try #require(
+        builder.slicedRow(fullSession, lower: lower, upperExclusive: upper)
+    )
+    let main = try #require(sliced.children?.first { $0.kind == .mainTurn })
+    let direct = try #require(main.children?.first { $0.id == "thread:agent-direct" })
+    let inferred = try #require(main.children?.first { $0.id == "thread:agent-inferred" })
+    let directTurn = try #require(direct.children?.first { $0.kind == .agentTurn })
+
+    #expect(sliced.ownUsage.totalTokens == 120)
+    #expect(sliced.subtreeUsage.totalTokens == 180)
+    #expect(main.ownUsage.totalTokens == 120)
+    #expect(main.subtreeUsage.totalTokens == 180)
+    #expect(direct.ownUsage.totalTokens == 40)
+    #expect(direct.subtreeUsage.totalTokens == 40)
+    #expect(directTurn.ownUsage.totalTokens == 40)
+    #expect(directTurn.subtreeUsage.totalTokens == 40)
+    #expect(inferred.subtreeUsage.totalTokens == 20)
+    #expect((main.children ?? []).reduce(Int64.zero) { $0 + $1.subtreeUsage.totalTokens } == 60)
+
+    // The side thread only has a 13:00 sample, so its whole zero-valued branch
+    // disappears while the full session interval remains visible.
+    #expect(sliced.children?.contains { $0.kind == .sideGroup } == false)
+    #expect(flatten(sliced).contains { $0.id == "thread:agent-side" } == false)
+    #expect(sliced.endTime == fullSession.endTime)
+    #expect(sliced.isUsageApproximate == false)
+    #expect(sliced.subtreeUsageSamples?.count == 3)
+    #expect(sliced.segments.count == 3)
+    #expect(sliced.apiUSDText == nil)
+
+    let estimator = CreditEstimator(catalog: catalog)
+    #expect(
+        sliced.creditEstimate
+            == estimator.estimate(sliced.segments, expectedTotalTokens: sliced.subtreeUsage.totalTokens)
+    )
+    #expect(
+        sliced.apiPriceEstimate
+            == estimator.estimateAPI(sliced.segments, expectedTotalTokens: sliced.subtreeUsage.totalTokens)
+    )
+
+    let trend = UsageTrendAggregator(catalog: catalog, calendar: utcCalendar()).aggregate(
+        reports: [report],
+        filter: UsageTrendFilter(startMinute: lower, endMinute: lower)
+    )
+    let trendSummary = try #require(trend.series.first?.summary)
+    #expect(sliced.subtreeUsage.totalTokens == trendSummary.tokens.totalTokens)
+    #expect(sliced.subtreeUsage.ordinaryInputTokens == trendSummary.tokens.ordinaryInputTokens)
+    #expect(sliced.subtreeUsage.cachedInputTokens == trendSummary.tokens.cachedInputTokens)
+    #expect(sliced.subtreeUsage.cacheWriteInputTokens == trendSummary.tokens.cacheWriteInputTokens)
+    #expect(sliced.subtreeUsage.outputTokens == trendSummary.tokens.outputTokens)
+    #expect(sliced.subtreeUsage.reasoningOutputTokens == trendSummary.tokens.reasoningOutputTokens)
+    #expect(sliced.creditEstimate?.amount == trendSummary.credits.amount)
+    #expect(sliced.creditEstimate?.pricedTokens == trendSummary.credits.pricedTokens)
+    #expect(sliced.apiPriceEstimate?.amount == trendSummary.apiUSD.amount)
+    #expect(sliced.apiPriceEstimate?.pricedTokens == trendSummary.apiUSD.pricedTokens)
+
+    let summary = try #require(builder.summaryRow(for: [sliced]))
+    #expect(summary.subtreeUsage == sliced.subtreeUsage)
+    #expect(summary.ownUsage == sliced.ownUsage)
+    #expect(summary.creditEstimate == sliced.creditEstimate)
+    #expect(summary.apiPriceEstimate == sliced.apiPriceEstimate)
+    #expect(summary.isUsageApproximate == false)
+    #expect(summary.name.contains("1 个会话"))
+
+    let emptyLower = try testTimestamp("2026-01-10T11:00:00Z")
+    let emptyUpper = try testTimestamp("2026-01-10T11:01:00Z")
+    #expect(
+        builder.slicedRow(fullSession, lower: emptyLower, upperExclusive: emptyUpper)?.id == nil
+    )
+}
+
+@Test("Legacy segments slice approximately while an exact empty sample plane stays empty")
+func legacyAndExactEmptyMinuteSlices() throws {
+    let catalog = try PricingCatalog.bundled()
+    let builder = UsageTreeBuilder(catalog: catalog)
+    let selectedUsage = TokenUsage(inputTokens: 1_000_000, outputTokens: 100_000)
+    let outsideUsage = TokenUsage(inputTokens: 200_000, outputTokens: 20_000)
+    let selectedAt = try testTimestamp("2026-03-15T10:00:00Z")
+    let outsideAt = try testTimestamp("2026-03-15T10:02:00Z")
+    let lower = selectedAt
+    let upper = try testTimestamp("2026-03-15T10:01:00Z")
+    let selectedSegment = testUsageSegment(at: selectedAt, usage: selectedUsage)
+    let outsideSegment = testUsageSegment(at: outsideAt, usage: outsideUsage)
+    let fullUsage = selectedUsage + outsideUsage
+    let legacy = UsageTreeRow(
+        id: "session:legacy",
+        kind: .session,
+        time: try testTimestamp("2026-03-15T09:55:00Z"),
+        endTime: try testTimestamp("2026-03-15T10:05:00Z"),
+        name: "Legacy",
+        ownUsage: fullUsage,
+        subtreeUsage: fullUsage,
+        counts: .zero,
+        segments: [selectedSegment, outsideSegment],
+        ownSegments: [selectedSegment, outsideSegment],
+        ownUsageSamples: nil,
+        subtreeUsageSamples: nil,
+        usageSampleFallbackTime: outsideAt,
+        modelSummary: "GPT-5.6 Sol",
+        creditEstimate: nil,
+        attribution: .direct
+    )
+
+    let sliced = try #require(builder.slicedRow(legacy, lower: lower, upperExclusive: upper))
+    #expect(sliced.ownUsage == selectedUsage)
+    #expect(sliced.subtreeUsage == selectedUsage)
+    #expect(sliced.segments == [selectedSegment])
+    #expect(sliced.isUsageApproximate)
+    #expect(sliced.warnings.contains { $0.contains("近似") })
+
+    let estimator = CreditEstimator(catalog: catalog)
+    #expect(
+        sliced.creditEstimate
+            == estimator.estimate([selectedSegment], expectedTotalTokens: selectedUsage.totalTokens)
+    )
+    #expect(
+        sliced.apiPriceEstimate
+            == estimator.estimateAPI([selectedSegment], expectedTotalTokens: selectedUsage.totalTokens)
+    )
+
+    let approximateSummary = try #require(builder.summaryRow(for: [sliced]))
+    #expect(approximateSummary.subtreeUsage == selectedUsage)
+    #expect(approximateSummary.isUsageApproximate)
+
+    // Older reports may have an exact task-level minute plane without the
+    // ownership IDs needed for the secondary "own" value. Keep those two
+    // accuracy states independent so the exact session total is not mislabeled.
+    let taskExactOwnershipApproximate = UsageTreeRow(
+        id: "session:mixed-accuracy",
+        kind: .session,
+        time: legacy.time,
+        endTime: legacy.endTime,
+        name: "Mixed Accuracy",
+        ownUsage: fullUsage,
+        subtreeUsage: fullUsage,
+        counts: .zero,
+        segments: [selectedSegment, outsideSegment],
+        ownSegments: [selectedSegment, outsideSegment],
+        ownUsageSamples: nil,
+        subtreeUsageSamples: [
+            UsageSample(minute: selectedAt, model: "gpt-5.6-sol", usage: selectedUsage),
+            UsageSample(minute: outsideAt, model: "gpt-5.6-sol", usage: outsideUsage)
+        ],
+        usageSampleFallbackTime: outsideAt,
+        modelSummary: "GPT-5.6 Sol",
+        creditEstimate: nil,
+        attribution: .direct
+    )
+    let mixedSlice = try #require(
+        builder.slicedRow(taskExactOwnershipApproximate, lower: lower, upperExclusive: upper)
+    )
+    #expect(!mixedSlice.isUsageApproximate)
+    #expect(mixedSlice.isOwnUsageApproximate)
+    let mixedSummary = try #require(builder.summaryRow(for: [mixedSlice]))
+    #expect(!mixedSummary.isUsageApproximate)
+    #expect(mixedSummary.isOwnUsageApproximate)
+
+    let exactEmpty = UsageTreeRow(
+        id: "session:exact-empty",
+        kind: .session,
+        time: legacy.time,
+        endTime: legacy.endTime,
+        name: "Exact Empty",
+        ownUsage: fullUsage,
+        subtreeUsage: fullUsage,
+        counts: .zero,
+        segments: [selectedSegment],
+        ownSegments: [selectedSegment],
+        ownUsageSamples: [],
+        subtreeUsageSamples: [],
+        usageSampleFallbackTime: selectedAt,
+        modelSummary: "GPT-5.6 Sol",
+        creditEstimate: nil,
+        attribution: .direct
+    )
+    #expect(builder.slicedRow(exactEmpty, lower: lower, upperExclusive: upper)?.id == nil)
+    #expect(builder.slicedRow(legacy, lower: upper, upperExclusive: upper)?.id == nil)
 }
 
 @Test("Credits and API prices use separate public rate tables", arguments: ["gpt-5.6-sol", "gpt-6-astra"])
@@ -622,6 +904,79 @@ private func makeSyntheticReportData(
     return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
+private func attributedSyntheticReport() throws -> UsageReport {
+    var object = try #require(
+        JSONSerialization.jsonObject(with: makeSyntheticReportData()) as? [String: Any]
+    )
+    var task = try #require(object["task"] as? [String: Any])
+    task["usage_samples"] = [
+        attributedUsageSample(
+            minute: "2026-01-10T12:00:00Z",
+            threadID: "session-root",
+            turnID: "turn-main",
+            usage: usage(input: 100, cached: 20, cacheWrite: 5, output: 20, reasoning: 5)
+        ),
+        attributedUsageSample(
+            minute: "2026-01-10T12:00:00Z",
+            threadID: "agent-direct",
+            turnID: "turn-direct",
+            usage: usage(input: 30, cached: 10, output: 10, reasoning: 2)
+        ),
+        attributedUsageSample(
+            minute: "2026-01-10T12:00:00Z",
+            threadID: "agent-inferred",
+            turnID: "turn-inferred",
+            usage: usage(input: 15, output: 5, reasoning: 1)
+        ),
+        attributedUsageSample(
+            minute: "2026-01-10T13:00:00Z",
+            threadID: "agent-side",
+            turnID: "turn-side",
+            usage: usage(input: 8, output: 2)
+        )
+    ]
+    object["task"] = task
+    return try UsageReportDecoder.decode(
+        JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    )
+}
+
+private func attributedUsageSample(
+    minute: String,
+    threadID: String,
+    turnID: String,
+    usage: [String: Any]
+) -> [String: Any] {
+    [
+        "minute": minute,
+        "thread_id": threadID,
+        "turn_id": turnID,
+        "model": "gpt-5.6-sol",
+        "effort": "medium",
+        "tier": "default",
+        "tier_source": "thread_settings",
+        "task_epoch": 1,
+        "long_context": false,
+        "usage": usage,
+        "request_count": 1
+    ]
+}
+
+private func testUsageSegment(at: Date, usage: TokenUsage) -> UsageSegment {
+    UsageSegment(
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        tier: "default",
+        tierSource: "thread_settings",
+        taskEpoch: 1,
+        longContext: false,
+        usage: usage,
+        firstAt: at,
+        lastAt: at,
+        requestCount: 1
+    )
+}
+
 private func historicalPolicyReport(
     hasUsageSamples: Bool = true,
     hasRateLimitSnapshots: Bool = true,
@@ -744,6 +1099,12 @@ private func utcCalendar() -> Calendar {
 
 private func date(_ year: Int, _ month: Int, _ day: Int, calendar: Calendar) -> Date {
     calendar.date(from: DateComponents(year: year, month: month, day: day))!
+}
+
+private func testTimestamp(_ value: String) throws -> Date {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    return try #require(formatter.date(from: value))
 }
 
 private func flatten(_ row: UsageTreeRow) -> [UsageTreeRow] {

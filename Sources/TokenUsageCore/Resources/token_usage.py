@@ -32,7 +32,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 
-CACHE_SCHEMA_VERSION = 13
+CACHE_SCHEMA_VERSION = 14
 CHECKPOINT_BYTES = 4096
 REPORT_SCHEMA_VERSION = 1
 PROMPT_PREVIEW_CHARACTERS = 240
@@ -696,6 +696,8 @@ def _utc_minute(timestamp: Any) -> Optional[str]:
 def _usage_sample_key(sample: Dict[str, Any]) -> Tuple[Any, ...]:
     return (
         sample.get("minute"),
+        sample.get("thread_id"),
+        sample.get("turn_id"),
         sample.get("model"),
         sample.get("effort"),
         sample.get("tier"),
@@ -717,6 +719,8 @@ def _add_usage_sample(
         return
     candidate = {
         "minute": _utc_minute(timestamp),
+        "thread_id": metadata.get("thread_id"),
+        "turn_id": metadata.get("turn_id"),
         "model": metadata.get("model"),
         "effort": metadata.get("effort"),
         "tier": metadata.get("tier"),
@@ -995,6 +999,8 @@ def _process_record(state: Dict[str, Any], record: Dict[str, Any]) -> None:
         state["raw_usage"] = _add_usage(_usage_from(state.get("raw_usage")), delta)
         turn = _ensure_turn(state, state.get("active_turn_id")) if state.get("active_turn_id") else None
         metadata = {
+            "thread_id": state.get("thread_id"),
+            "turn_id": state.get("active_turn_id"),
             "model": turn.get("model") if turn else state["settings"].get("model"),
             "effort": turn.get("effort") if turn else state["settings"].get("effort"),
             "tier": turn.get("tier") if turn else state["settings"].get("tier"),
@@ -1438,6 +1444,8 @@ def _merge_usage_samples(values: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
             continue
         candidate = {
             "minute": value.get("minute"),
+            "thread_id": value.get("thread_id"),
+            "turn_id": value.get("turn_id"),
             "model": value.get("model"),
             "effort": value.get("effort"),
             "tier": value.get("tier"),

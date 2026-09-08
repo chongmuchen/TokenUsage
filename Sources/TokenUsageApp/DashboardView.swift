@@ -172,7 +172,7 @@ struct DashboardView: View {
         ContentUnavailableView {
             Label("没有符合条件的会话", systemImage: "line.3.horizontal.decrease.circle")
         } description: {
-            Text("调整日期或 Token 总数范围，也可以刷新报告。")
+            Text("调整日期、Token 口径或 Token 范围，也可以刷新报告。")
         } actions: {
             Button("最近一个月") {
                 viewModel.applyPreset(.month)

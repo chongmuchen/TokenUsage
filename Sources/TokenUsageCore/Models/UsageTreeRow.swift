@@ -16,16 +16,39 @@ public enum AttributionKind: String, Sendable {
     case unattributed
 }
 
+public enum UsageTokenScope: String, CaseIterable, Identifiable, Sendable {
+    case sessionTotal
+    case selectedRange
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .sessionTotal: "会话总 Token"
+        case .selectedRange: "时段内 Token"
+        }
+    }
+}
+
 public struct UsageTreeRow: Identifiable, Sendable {
     public let id: String
     public let kind: UsageRowKind
     public let time: Date?
+    public let endTime: Date?
     public let name: String
     public let ownUsage: TokenUsage
     public let subtreeUsage: TokenUsage
     public let counts: UsageCounts
     public let imageGenerations: [ImageGenerationDetail]
     public let segments: [UsageSegment]
+    /// Segments owned by this row only. `segments` remains the subtree pricing
+    /// plane for backwards compatibility.
+    public let ownSegments: [UsageSegment]
+    /// Optional exact minute samples. `nil` identifies a legacy report/row and
+    /// triggers the timestamped-segment compatibility path when range slicing.
+    public let ownUsageSamples: [UsageSample]?
+    public let subtreeUsageSamples: [UsageSample]?
+    public let usageSampleFallbackTime: Date?
     public let modelSummary: String
     public let creditEstimate: CreditEstimate?
     public let apiPriceEstimate: APIPriceEstimate?
@@ -33,6 +56,14 @@ public struct UsageTreeRow: Identifiable, Sendable {
     public let attribution: AttributionKind
     public let isProvisional: Bool
     public let isLowerBound: Bool
+    /// Approximation state for the subtree figures shown in the primary Token
+    /// and breakdown columns.
+    public let isUsageApproximate: Bool
+    /// Approximation state for the secondary "自身" figure. A legacy report
+    /// can still have an exact task-level minute plane while lacking the IDs
+    /// needed to slice its root/turn ownership exactly.
+    public let isOwnUsageApproximate: Bool
+    public let pricingSuppressed: Bool
     public let warnings: [String]
     public let children: [UsageTreeRow]?
 
@@ -40,12 +71,17 @@ public struct UsageTreeRow: Identifiable, Sendable {
         id: String,
         kind: UsageRowKind,
         time: Date?,
+        endTime: Date? = nil,
         name: String,
         ownUsage: TokenUsage,
         subtreeUsage: TokenUsage,
         counts: UsageCounts,
         imageGenerations: [ImageGenerationDetail] = [],
         segments: [UsageSegment],
+        ownSegments: [UsageSegment]? = nil,
+        ownUsageSamples: [UsageSample]? = nil,
+        subtreeUsageSamples: [UsageSample]? = nil,
+        usageSampleFallbackTime: Date? = nil,
         modelSummary: String,
         creditEstimate: CreditEstimate?,
         apiPriceEstimate: APIPriceEstimate? = nil,
@@ -53,18 +89,26 @@ public struct UsageTreeRow: Identifiable, Sendable {
         attribution: AttributionKind,
         isProvisional: Bool = false,
         isLowerBound: Bool = false,
+        isUsageApproximate: Bool = false,
+        isOwnUsageApproximate: Bool? = nil,
+        pricingSuppressed: Bool = false,
         warnings: [String] = [],
         children: [UsageTreeRow]? = nil
     ) {
         self.id = id
         self.kind = kind
         self.time = time
+        self.endTime = endTime
         self.name = name
         self.ownUsage = ownUsage
         self.subtreeUsage = subtreeUsage
         self.counts = counts
         self.imageGenerations = imageGenerations
         self.segments = segments
+        self.ownSegments = ownSegments ?? segments
+        self.ownUsageSamples = ownUsageSamples
+        self.subtreeUsageSamples = subtreeUsageSamples
+        self.usageSampleFallbackTime = usageSampleFallbackTime
         self.modelSummary = modelSummary
         self.creditEstimate = creditEstimate
         self.apiPriceEstimate = apiPriceEstimate
@@ -72,6 +116,9 @@ public struct UsageTreeRow: Identifiable, Sendable {
         self.attribution = attribution
         self.isProvisional = isProvisional
         self.isLowerBound = isLowerBound
+        self.isUsageApproximate = isUsageApproximate
+        self.isOwnUsageApproximate = isOwnUsageApproximate ?? isUsageApproximate
+        self.pricingSuppressed = pricingSuppressed
         self.warnings = warnings
         self.children = children?.isEmpty == true ? nil : children
     }
@@ -92,6 +139,7 @@ public struct UsageFilter: Equatable, Sendable {
     public var minimumTokensText: String
     public var maximumTokensText: String
     public var preset: DatePreset
+    public var tokenScope: UsageTokenScope
 
     public init(now: Date = Date(), calendar: Calendar = .current) {
         let startOfToday = calendar.startOfDay(for: now)
@@ -100,6 +148,7 @@ public struct UsageFilter: Equatable, Sendable {
         self.minimumTokensText = ""
         self.maximumTokensText = ""
         self.preset = .month
+        self.tokenScope = .sessionTotal
     }
 
     public var minimumTokens: Int64? {
@@ -158,13 +207,21 @@ public struct UsageFilter: Equatable, Sendable {
         }
     }
 
-    public func includes(_ row: UsageTreeRow, calendar: Calendar = .current) -> Bool {
-        guard row.kind == .session, let time = row.time else { return false }
+    public func overlapsDateRange(_ row: UsageTreeRow, calendar: Calendar = .current) -> Bool {
+        guard row.kind == .session, let start = row.time else { return false }
         let (lower, upper) = minuteRange(calendar: calendar)
-        guard time >= lower && time < upper else { return false }
+        let end = max(row.endTime ?? start, start)
+        return start < upper && end >= lower
+    }
+
+    public func includesTokenBounds(_ row: UsageTreeRow) -> Bool {
         if let minimumTokens, row.subtreeUsage.totalTokens < minimumTokens { return false }
         if let maximumTokens, row.subtreeUsage.totalTokens > maximumTokens { return false }
         return true
+    }
+
+    public func includes(_ row: UsageTreeRow, calendar: Calendar = .current) -> Bool {
+        overlapsDateRange(row, calendar: calendar) && includesTokenBounds(row)
     }
 
     /// Returns a half-open range that includes every timestamp in the selected

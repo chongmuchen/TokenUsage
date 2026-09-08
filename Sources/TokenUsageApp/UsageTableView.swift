@@ -27,9 +27,9 @@ struct UsageTableView: View {
             columnCustomization: $columnCustomization
         ) {
             TableColumn("时间") { row in
-                TimeCell(date: row.time)
+                TimeCell(row: row)
             }
-            .width(min: 125, ideal: 145, max: 180)
+            .width(min: 170, ideal: 190, max: 220)
             .customizationID("time")
 
             TableColumn("会话 / 对话") { row in
@@ -39,16 +39,19 @@ struct UsageTableView: View {
             .customizationID("name")
 
             TableColumn(
-                "Token（总 / 自身）",
+                "Token（含子级 / 自身）",
                 sortUsing: UsageRowSortComparator(field: .totalTokens)
             ) { row in
                 TotalAndOwnTokenCell(row: row)
             }
-            .width(min: 120, ideal: 138, max: 170)
+            .width(min: 135, ideal: 150, max: 185)
             .customizationID("total-own")
 
             TableColumn("输入") { row in
-                TokenCell(value: row.subtreeUsage.inputTokens)
+                TokenCell(
+                    value: row.subtreeUsage.inputTokens,
+                    isApproximate: row.isUsageApproximate
+                )
             }
             .width(min: 82, ideal: 92, max: 120)
             .customizationID("input")
@@ -56,20 +59,27 @@ struct UsageTableView: View {
             TableColumn("缓存（读 / 写）") { row in
                 CacheCell(
                     read: row.subtreeUsage.cachedInputTokens,
-                    write: row.subtreeUsage.cacheWriteInputTokens
+                    write: row.subtreeUsage.cacheWriteInputTokens,
+                    isApproximate: row.isUsageApproximate
                 )
             }
             .width(min: 112, ideal: 128, max: 155)
             .customizationID("cache")
 
             TableColumn("输出") { row in
-                TokenCell(value: row.subtreeUsage.outputTokens)
+                TokenCell(
+                    value: row.subtreeUsage.outputTokens,
+                    isApproximate: row.isUsageApproximate
+                )
             }
             .width(min: 82, ideal: 92, max: 120)
             .customizationID("output")
 
             TableColumn("推理") { row in
-                TokenCell(value: row.subtreeUsage.reasoningOutputTokens)
+                TokenCell(
+                    value: row.subtreeUsage.reasoningOutputTokens,
+                    isApproximate: row.isUsageApproximate
+                )
             }
             .width(min: 82, ideal: 92, max: 120)
             .customizationID("reasoning")
@@ -164,16 +174,43 @@ private struct UsageRowSortComparator: SortComparator {
 }
 
 private struct TimeCell: View {
-    let date: Date?
+    let row: UsageTreeRow
 
     var body: some View {
-        if let date {
-            Text(date, format: .dateTime.year().month(.twoDigits).day(.twoDigits).hour().minute())
-                .monospacedDigit()
-                .lineLimit(1)
+        if showsRange {
+            VStack(alignment: .leading, spacing: 1) {
+                timestampLine(label: "开始", date: row.time)
+                timestampLine(label: "结束", date: row.endTime)
+            }
+        } else if let date = row.time {
+            timestamp(date)
         } else {
             Text("—").foregroundStyle(.secondary)
         }
+    }
+
+    private var showsRange: Bool {
+        row.kind == .session || row.endTime != nil
+    }
+
+    private func timestampLine(label: String, date: Date?) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .foregroundStyle(.secondary)
+                .frame(width: 28, alignment: .leading)
+            if let date {
+                timestamp(date)
+            } else {
+                Text("—")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func timestamp(_ date: Date) -> some View {
+        Text(date, format: .dateTime.year().month(.twoDigits).day(.twoDigits).hour().minute())
+            .monospacedDigit()
+            .lineLimit(1)
     }
 }
 
@@ -484,12 +521,13 @@ private struct MissingImageGenerationCard: View {
 private struct TokenCell: View {
     let value: Int64
     var isLowerBound = false
+    var isApproximate = false
 
     var body: some View {
-        Text((isLowerBound ? "≥" : "") + TokenFormatter.compact(value))
+        Text(qualifiedToken(value, isLowerBound: isLowerBound, isApproximate: isApproximate))
             .monospacedDigit()
             .frame(maxWidth: .infinity, alignment: .trailing)
-            .help((isLowerBound ? "至少 " : "") + TokenFormatter.exact(value) + " tokens")
+            .help(tokenHelp(value, isLowerBound: isLowerBound, isApproximate: isApproximate))
     }
 }
 
@@ -498,11 +536,19 @@ private struct TotalAndOwnTokenCell: View {
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 1) {
-            Text((row.isLowerBound ? "≥" : "") + TokenFormatter.compact(row.subtreeUsage.totalTokens))
+            Text(qualifiedToken(
+                row.subtreeUsage.totalTokens,
+                isLowerBound: row.isLowerBound,
+                isApproximate: row.isUsageApproximate
+            ))
                 .monospacedDigit()
                 .fontWeight(row.kind == .summary ? .semibold : .regular)
             if row.kind != .summary {
-                Text("自身 " + TokenFormatter.compact(row.ownUsage.totalTokens))
+                Text("自身 " + qualifiedToken(
+                    row.ownUsage.totalTokens,
+                    isLowerBound: false,
+                    isApproximate: row.isOwnUsageApproximate
+                ))
                     .font(.caption)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
@@ -514,23 +560,81 @@ private struct TotalAndOwnTokenCell: View {
 
     private var helpText: String {
         if row.kind == .summary {
-            return "当前筛选会话合计 \(TokenFormatter.exact(row.subtreeUsage.totalTokens)) tokens"
+            return tokenHelp(
+                row.subtreeUsage.totalTokens,
+                isLowerBound: row.isLowerBound,
+                isApproximate: row.isUsageApproximate,
+                label: "当前筛选会话合计"
+            )
         }
-        return "含子级 \(TokenFormatter.exact(row.subtreeUsage.totalTokens))；"
+        let base = "含子级 \(TokenFormatter.exact(row.subtreeUsage.totalTokens))；"
             + "自身 \(TokenFormatter.exact(row.ownUsage.totalTokens)) tokens"
+        var result = base + usageQualifierHelp(
+            isLowerBound: row.isLowerBound,
+            isApproximate: row.isUsageApproximate
+        )
+        if row.isOwnUsageApproximate && !row.isUsageApproximate {
+            result += "\n≈ 仅自身用量缺少完整的分钟归属，已近似计算"
+        }
+        return result
     }
 }
 
 private struct CacheCell: View {
     let read: Int64
     let write: Int64
+    var isLowerBound = false
+    var isApproximate = false
 
     var body: some View {
-        Text("\(TokenFormatter.compact(read)) / \(TokenFormatter.compact(write))")
+        Text(
+            "\(qualifiedToken(read, isLowerBound: isLowerBound, isApproximate: isApproximate)) / "
+                + qualifiedToken(write, isLowerBound: isLowerBound, isApproximate: isApproximate)
+        )
             .monospacedDigit()
             .frame(maxWidth: .infinity, alignment: .trailing)
-            .help("缓存读 \(TokenFormatter.exact(read))；缓存写 \(TokenFormatter.exact(write))")
+            .help(
+                "缓存读 \(TokenFormatter.exact(read))；缓存写 \(TokenFormatter.exact(write))"
+                    + usageQualifierHelp(
+                        isLowerBound: isLowerBound,
+                        isApproximate: isApproximate
+                    )
+            )
     }
+}
+
+private func qualifiedToken(
+    _ value: Int64,
+    isLowerBound: Bool,
+    isApproximate: Bool
+) -> String {
+    let approximation = isApproximate ? "≈" : ""
+    let separator = isApproximate && isLowerBound ? " " : ""
+    let lowerBound = isLowerBound ? "≥" : ""
+    return approximation + separator + lowerBound + TokenFormatter.compact(value)
+}
+
+private func tokenHelp(
+    _ value: Int64,
+    isLowerBound: Bool,
+    isApproximate: Bool,
+    label: String? = nil
+) -> String {
+    let prefix = label.map { $0 + " " } ?? ""
+    let lowerBound = isLowerBound ? "至少 " : ""
+    return prefix + lowerBound + TokenFormatter.exact(value) + " tokens"
+        + usageQualifierHelp(isLowerBound: isLowerBound, isApproximate: isApproximate)
+}
+
+private func usageQualifierHelp(isLowerBound: Bool, isApproximate: Bool) -> String {
+    var notes: [String] = []
+    if isLowerBound {
+        notes.append("≥ 表示当前记录只能确认此下界")
+    }
+    if isApproximate {
+        notes.append("≈ 表示该值缺少完整的分钟归属，已按观测时间近似计算")
+    }
+    return notes.isEmpty ? "" : "\n" + notes.joined(separator: "\n")
 }
 
 private struct CreditsCell: View {

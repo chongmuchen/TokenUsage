@@ -346,6 +346,8 @@ func parserMinuteSamplesReconcile() throws {
     let report = try UsageReportDecoder.decode(output)
     let samples = try #require(report.task.usageSamples)
     #expect(samples.count == 1)
+    #expect(samples.first?.threadId == sessionID)
+    #expect(samples.first?.turnId == turnID)
     #expect(samples.first?.requestCount == 2)
     #expect(samples.first?.usage.totalTokens == 170)
     #expect(TokenUsage.sum(samples.map(\.usage)) == report.task.usage)
@@ -366,6 +368,11 @@ func parserMinuteSamplesReconcile() throws {
     #expect(image.outputBytes == Int64(Data(base64Encoded: onePixelPNG)?.count ?? 0))
 
     let raw = try #require(try JSONSerialization.jsonObject(with: output) as? [String: Any])
+    let rawTask = try #require(raw["task"] as? [String: Any])
+    let rawSamples = try #require(rawTask["usage_samples"] as? [[String: Any]])
+    #expect(rawSamples.count == 1)
+    #expect(rawSamples.first?["thread_id"] as? String == sessionID)
+    #expect(rawSamples.first?["turn_id"] as? String == turnID)
     let threads = try #require(raw["threads"] as? [[String: Any]])
     #expect(threads.allSatisfy { $0["usage_samples"] == nil })
     #expect(threads.flatMap { $0["turns"] as? [[String: Any]] ?? [] }.allSatisfy {
@@ -373,22 +380,42 @@ func parserMinuteSamplesReconcile() throws {
     })
 }
 
-@Test("Forked transcripts exclude inherited usage samples before the owned boundary")
-func parserForkSampleOwnership() throws {
+@Test("Parser keeps same-minute usage samples separate by thread and turn")
+func parserUsageSampleMergePreservesAttribution() throws {
     let script = try #require(TokenUsageResources.url(forResource: "token_usage", withExtension: "py"))
     let code = """
         import json, runpy, sys
         ns = runpy.run_path(sys.argv[1])
-        state = {
-            "forked_from_id": "parent",
-            "usage_samples": [
-                {"task_epoch": 1, "usage": {"total_tokens": 10}},
-                {"task_epoch": 2, "usage": {"total_tokens": 20}},
-                {"task_epoch": 3, "usage": {"total_tokens": 30}},
-            ],
-        }
-        owned = ns["_owned_usage_samples"](state, {"task_epoch": 2})
-        print(json.dumps([item["task_epoch"] for item in owned]))
+
+        def sample(thread_id, turn_id, total_tokens, request_count=1):
+            return {
+                "minute": "2026-08-20T10:00:00Z",
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "model": "gpt-5.6-sol",
+                "effort": "medium",
+                "tier": "default",
+                "tier_source": "thread_settings",
+                "task_epoch": 1,
+                "long_context": False,
+                "usage": {
+                    "input_tokens": total_tokens,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": total_tokens,
+                },
+                "request_count": request_count,
+            }
+
+        merged = ns["_merge_usage_samples"]([
+            sample("root", "turn-a", 10),
+            sample("root", "turn-a", 5),
+            sample("root", "turn-b", 20),
+            sample("agent", "turn-a", 30),
+        ])
+        print(json.dumps(merged))
         """
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
@@ -402,8 +429,66 @@ func parserForkSampleOwnership() throws {
     process.waitUntilExit()
     let output = stdout.fileHandleForReading.readDataToEndOfFile()
     #expect(process.terminationStatus == 0)
-    let epochs = try JSONSerialization.jsonObject(with: output) as? [Int]
-    #expect(epochs == [2, 3])
+
+    let samples = try #require(try JSONSerialization.jsonObject(with: output) as? [[String: Any]])
+    #expect(samples.count == 3)
+    let identities = Set(samples.compactMap { sample -> String? in
+        guard let threadID = sample["thread_id"] as? String,
+              let turnID = sample["turn_id"] as? String
+        else { return nil }
+        return "\(threadID)/\(turnID)"
+    })
+    #expect(identities == ["root/turn-a", "root/turn-b", "agent/turn-a"])
+    let rootTurnA = try #require(samples.first {
+        $0["thread_id"] as? String == "root" && $0["turn_id"] as? String == "turn-a"
+    })
+    let rootTurnAUsage = try #require(rootTurnA["usage"] as? [String: Any])
+    #expect(rootTurnAUsage["total_tokens"] as? Int == 15)
+    #expect(rootTurnA["request_count"] as? Int == 2)
+}
+
+@Test("Forked transcripts exclude inherited usage samples before the owned boundary")
+func parserForkSampleOwnership() throws {
+    let script = try #require(TokenUsageResources.url(forResource: "token_usage", withExtension: "py"))
+    let code = """
+        import json, runpy, sys
+        ns = runpy.run_path(sys.argv[1])
+        state = {
+            "forked_from_id": "parent",
+            "usage_samples": [
+                {"task_epoch": 1, "thread_id": "child", "turn_id": "inherited", "usage": {"total_tokens": 10}},
+                {"task_epoch": 2, "thread_id": "child", "turn_id": "owned-1", "usage": {"total_tokens": 20}},
+                {"task_epoch": 3, "thread_id": "child", "turn_id": "owned-2", "usage": {"total_tokens": 30}},
+            ],
+        }
+        owned = ns["_owned_usage_samples"](state, {"task_epoch": 2})
+        print(json.dumps([
+            [item["task_epoch"], item["thread_id"], item["turn_id"]]
+            for item in owned
+        ]))
+        """
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+    process.arguments = ["-c", code, script.path]
+    var environment = ProcessInfo.processInfo.environment
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    process.environment = environment
+    let stdout = Pipe()
+    process.standardOutput = stdout
+    try process.run()
+    process.waitUntilExit()
+    let output = stdout.fileHandleForReading.readDataToEndOfFile()
+    #expect(process.terminationStatus == 0)
+    let owned = try #require(try JSONSerialization.jsonObject(with: output) as? [[Any]])
+    #expect(owned.count == 2)
+    let first = try #require(owned.first)
+    let last = try #require(owned.last)
+    #expect(first[0] as? Int == 2)
+    #expect(first[1] as? String == "child")
+    #expect(first[2] as? String == "owned-1")
+    #expect(last[0] as? Int == 3)
+    #expect(last[1] as? String == "child")
+    #expect(last[2] as? String == "owned-2")
 }
 
 @Test("Transcript resolution never follows a copied Home's stale absolute rollout path")

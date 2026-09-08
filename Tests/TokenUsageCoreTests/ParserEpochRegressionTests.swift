@@ -18,7 +18,7 @@ func parserRebasesCounterAtNewTaskEpoch() throws {
     #expect(rawUsage["input_tokens"] as? Int == 210)
     #expect(rawUsage["output_tokens"] as? Int == 28)
     #expect(rawUsage["total_tokens"] as? Int == 238)
-    #expect(state["cache_schema_version"] as? Int == 13)
+    #expect(state["cache_schema_version"] as? Int == 14)
     #expect(state["last_total_usage_task_epoch"] as? Int == 2)
 
     let turns = try #require(state["turns"] as? [String: [String: Any]])

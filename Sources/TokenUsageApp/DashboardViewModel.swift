@@ -87,7 +87,22 @@ final class DashboardViewModel: ObservableObject {
     }
 
     var filteredSessions: [UsageTreeRow] {
-        sessions.filter { filter.includes($0) }
+        let overlapping = sessions.filter { filter.overlapsDateRange($0) }
+        switch filter.tokenScope {
+        case .sessionTotal:
+            return overlapping.filter { filter.includesTokenBounds($0) }
+        case .selectedRange:
+            let range = filter.minuteRange()
+            return overlapping
+                .compactMap {
+                    builder.slicedRow(
+                        $0,
+                        lower: range.lower,
+                        upperExclusive: range.upperExclusive
+                    )
+                }
+                .filter { filter.includesTokenBounds($0) }
+        }
     }
 
     var filteredRowsWithSummary: [UsageTreeRow] {
@@ -646,12 +661,17 @@ final class DashboardViewModel: ObservableObject {
             id: "home:\(homeID.uuidString):\(row.id)",
             kind: row.kind,
             time: row.time,
+            endTime: row.endTime,
             name: row.name,
             ownUsage: row.ownUsage,
             subtreeUsage: row.subtreeUsage,
             counts: row.counts,
             imageGenerations: row.imageGenerations,
             segments: row.segments,
+            ownSegments: row.ownSegments,
+            ownUsageSamples: row.ownUsageSamples,
+            subtreeUsageSamples: row.subtreeUsageSamples,
+            usageSampleFallbackTime: row.usageSampleFallbackTime,
             modelSummary: row.modelSummary,
             creditEstimate: row.creditEstimate,
             apiPriceEstimate: row.apiPriceEstimate,
@@ -659,6 +679,9 @@ final class DashboardViewModel: ObservableObject {
             attribution: row.attribution,
             isProvisional: row.isProvisional,
             isLowerBound: row.isLowerBound,
+            isUsageApproximate: row.isUsageApproximate,
+            isOwnUsageApproximate: row.isOwnUsageApproximate,
+            pricingSuppressed: row.pricingSuppressed,
             warnings: row.warnings,
             children: row.children?.map { namespace($0, homeID: homeID) }
         )

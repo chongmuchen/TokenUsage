@@ -115,6 +115,8 @@ public struct UsageTreeBuilder: Sendable {
             time: row.time,
             endTime: row.endTime,
             name: row.name,
+            projectName: row.projectName,
+            projectPath: row.projectPath,
             ownUsage: own.usage,
             subtreeUsage: subtree.usage,
             counts: row.counts,
@@ -139,7 +141,12 @@ public struct UsageTreeBuilder: Sendable {
         )
     }
 
-    public func build(report: UsageReport, title: String?) -> UsageTreeRow {
+    public func build(
+        report: UsageReport,
+        title: String?,
+        projectName: String? = nil,
+        projectPath: String? = nil
+    ) -> UsageTreeRow {
         let threadByID = Dictionary(report.threads.map { ($0.threadId, $0) }, uniquingKeysWith: { first, _ in first })
         let root = threadByID[report.rootThreadId]
         let pricingSuppressed = report.task.cost.costSuppressed == true
@@ -592,6 +599,8 @@ public struct UsageTreeBuilder: Sendable {
             name: title?.nonEmpty
                 ?? report.displayName?.nonEmpty
                 ?? "会话 \(shortID(report.rootThreadId))",
+            projectName: projectName,
+            projectPath: projectPath,
             ownUsage: report.task.rootUsage,
             subtreeUsage: report.task.usage,
             counts: report.task.counts,

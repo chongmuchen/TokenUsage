@@ -24,6 +24,22 @@ func reportV1Decoding() throws {
     #expect(segment.requestCount == 4)
 }
 
+@Test("Working directories provide compact project names")
+func workingDirectoryProjectNames() {
+    #expect(
+        ThreadTitleStore.makeProjectName(
+            fromWorkingDirectory: "/Users/example/workspace/TokenUsage/"
+        ) == "TokenUsage"
+    )
+    #expect(
+        ThreadTitleStore.makeProjectName(
+            fromWorkingDirectory: "/Users/example/.codex/worktrees/7a21/GameResearch"
+        ) == "GameResearch"
+    )
+    #expect(ThreadTitleStore.makeProjectName(fromWorkingDirectory: "  ") == nil)
+    #expect(ThreadTitleStore.makeProjectName(fromWorkingDirectory: "/") == nil)
+}
+
 @Test("Optional image-generation details decode and follow their turn through the tree")
 func optionalImageGenerationDetails() throws {
     let base = try #require(
@@ -107,6 +123,70 @@ func datePresetRanges() throws {
     filter.apply(.custom, now: now, calendar: calendar)
     #expect(filter.startDate == customStart)
     #expect(filter.endDate == customEnd)
+}
+
+@Test("Limit-period preset converts a half-open reset window to inclusive picker minutes")
+func limitPeriodPresetRange() throws {
+    let calendar = utcCalendar()
+    let now = try testTimestamp("2026-09-08T09:00:00Z")
+    let periodStart = try testTimestamp("2026-09-01T09:02:45Z")
+    let periodEndExclusive = try testTimestamp("2026-09-08T10:05:37Z")
+    let expectedStartMinute = try testTimestamp("2026-09-01T09:02:00Z")
+    let expectedLastIncludedMinute = try testTimestamp("2026-09-08T10:04:00Z")
+    let expectedUpperExclusive = try testTimestamp("2026-09-08T10:05:00Z")
+    var filter = UsageFilter(now: now, calendar: calendar)
+    filter.minimumTokensText = "100k"
+    filter.maximumTokensText = "2M"
+    filter.tokenScope = .selectedRange
+
+    let applied = filter.applyLimitPeriod(
+        start: periodStart,
+        endExclusive: periodEndExclusive,
+        calendar: calendar
+    )
+
+    #expect(applied)
+    #expect(filter.preset == .limitPeriod)
+    #expect(DatePreset.limitPeriod.rawValue == "本周期（额度周期）")
+    #expect(filter.startDate == expectedStartMinute)
+    #expect(filter.endDate == expectedLastIncludedMinute)
+    #expect(filter.minimumTokensText == "100k")
+    #expect(filter.maximumTokensText == "2M")
+    #expect(filter.tokenScope == .selectedRange)
+
+    let range = filter.minuteRange(calendar: calendar)
+    #expect(range.lower == expectedStartMinute)
+    #expect(range.upperExclusive == expectedUpperExclusive)
+}
+
+@Test("Invalid limit periods do not mutate the current filter")
+func invalidLimitPeriodDoesNotMutateFilter() throws {
+    let calendar = utcCalendar()
+    let now = try testTimestamp("2026-09-08T09:00:00Z")
+    var filter = UsageFilter(now: now, calendar: calendar)
+    filter.startDate = try testTimestamp("2026-08-01T12:34:00Z")
+    filter.endDate = try testTimestamp("2026-08-02T13:45:00Z")
+    filter.minimumTokensText = "42"
+    filter.maximumTokensText = "84"
+    filter.tokenScope = .selectedRange
+    filter.preset = .custom
+    let original = filter
+
+    let sameMinuteApplied = filter.applyLimitPeriod(
+        start: try testTimestamp("2026-09-08T10:05:01Z"),
+        endExclusive: try testTimestamp("2026-09-08T10:05:59Z"),
+        calendar: calendar
+    )
+    #expect(!sameMinuteApplied)
+    #expect(filter == original)
+
+    let reversedApplied = filter.applyLimitPeriod(
+        start: try testTimestamp("2026-09-08T11:00:00Z"),
+        endExclusive: try testTimestamp("2026-09-08T10:00:00Z"),
+        calendar: calendar
+    )
+    #expect(!reversedApplied)
+    #expect(filter == original)
 }
 
 @Test("Minute range includes the complete selected end minute")
@@ -370,7 +450,12 @@ func exactMinuteSliceRollupAndPricing() throws {
     let report = try attributedSyntheticReport()
     let catalog = try PricingCatalog.bundled()
     let builder = UsageTreeBuilder(catalog: catalog)
-    let fullSession = builder.build(report: report, title: "Attributed")
+    let fullSession = builder.build(
+        report: report,
+        title: "Attributed",
+        projectName: "TokenUsage",
+        projectPath: "/Users/example/workspace/TokenUsage"
+    )
     let lower = try testTimestamp("2026-01-10T12:00:00Z")
     let upper = try testTimestamp("2026-01-10T12:01:00Z")
 
@@ -398,6 +483,8 @@ func exactMinuteSliceRollupAndPricing() throws {
     #expect(sliced.children?.contains { $0.kind == .sideGroup } == false)
     #expect(flatten(sliced).contains { $0.id == "thread:agent-side" } == false)
     #expect(sliced.endTime == fullSession.endTime)
+    #expect(sliced.projectName == "TokenUsage")
+    #expect(sliced.projectPath == "/Users/example/workspace/TokenUsage")
     #expect(sliced.isUsageApproximate == false)
     #expect(sliced.subtreeUsageSamples?.count == 3)
     #expect(sliced.segments.count == 3)
@@ -436,6 +523,8 @@ func exactMinuteSliceRollupAndPricing() throws {
     #expect(summary.apiPriceEstimate == sliced.apiPriceEstimate)
     #expect(summary.isUsageApproximate == false)
     #expect(summary.name.contains("1 个会话"))
+    #expect(summary.projectName == nil)
+    #expect(summary.projectPath == nil)
 
     let emptyLower = try testTimestamp("2026-01-10T11:00:00Z")
     let emptyUpper = try testTimestamp("2026-01-10T11:01:00Z")

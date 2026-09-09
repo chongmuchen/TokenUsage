@@ -165,6 +165,18 @@ final class DashboardViewModel: ObservableObject {
         return "显示 \(filteredSessions.count) / \(sessions.count) 个会话"
     }
 
+    /// The exact active window backing the current weekly-limit card. Reusing
+    /// this projection keeps the shortcut on the same Home/account selection
+    /// as the figures shown in the dashboard.
+    var currentLimitPeriod: DateInterval? {
+        guard let projection = weeklyLimitOverview?.current else { return nil }
+        let now = Date()
+        guard projection.periodStart <= now, projection.periodEnd > now else { return nil }
+        return DateInterval(start: projection.periodStart, end: projection.periodEnd)
+    }
+
+    var hasActiveLimitPeriod: Bool { currentLimitPeriod != nil }
+
     /// A compact description suitable for a toolbar or settings summary.
     var codexHomePathSummary: String {
         if homes.count == 1 { return homes[0].pathSummary }
@@ -172,6 +184,14 @@ final class DashboardViewModel: ObservableObject {
     }
 
     func applyPreset(_ preset: DatePreset) {
+        if preset == .limitPeriod {
+            guard let period = currentLimitPeriod else {
+                if filter.preset == .limitPeriod { filter.preset = .custom }
+                return
+            }
+            _ = filter.applyLimitPeriod(start: period.start, endExclusive: period.end)
+            return
+        }
         filter.apply(preset)
     }
 
@@ -321,21 +341,27 @@ final class DashboardViewModel: ObservableObject {
                 }
             }
 
-            var titlesByHome: [UUID: [String: String]] = [:]
+            var metadataByHome: [UUID: [String: ThreadDisplayMetadata]] = [:]
             let grouped = Dictionary(grouping: winners.values, by: { $0.home.id })
             for (homeID, candidates) in grouped {
                 guard let home = candidates.first?.home else { continue }
-                titlesByHome[homeID] = await titleStore.titles(
-                    for: Set(candidates.filter { $0.report.displayName == nil }.map { $0.report.rootThreadId }),
+                metadataByHome[homeID] = await titleStore.metadata(
+                    for: Set(candidates.map { $0.report.rootThreadId }),
                     codexRoot: home.rootURL
                 )
             }
 
             let rows = winners.values.map { candidate in
+                let metadata = metadataByHome[candidate.home.id]?[candidate.report.rootThreadId]
                 let title = candidate.report.displayName
-                    ?? titlesByHome[candidate.home.id]?[candidate.report.rootThreadId]
+                    ?? metadata?.title
                 return namespace(
-                    builder.build(report: candidate.report, title: title),
+                    builder.build(
+                        report: candidate.report,
+                        title: title,
+                        projectName: metadata?.projectName,
+                        projectPath: metadata?.projectPath
+                    ),
                     homeID: candidate.home.id
                 )
             }.sorted { ($0.time ?? .distantPast) > ($1.time ?? .distantPast) }
@@ -405,6 +431,9 @@ final class DashboardViewModel: ObservableObject {
             await MainActor.run { [weak self] in
                 guard let self, generation == self.loadGeneration else { return }
                 self.weeklyLimitOverview = overview
+                if self.filter.preset == .limitPeriod {
+                    self.applyPreset(.limitPeriod)
+                }
                 self.weeklyLimitOverviewTask = nil
             }
         }
@@ -663,6 +692,8 @@ final class DashboardViewModel: ObservableObject {
             time: row.time,
             endTime: row.endTime,
             name: row.name,
+            projectName: row.projectName,
+            projectPath: row.projectPath,
             ownUsage: row.ownUsage,
             subtreeUsage: row.subtreeUsage,
             counts: row.counts,

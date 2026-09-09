@@ -38,6 +38,20 @@ struct UsageTableView: View {
             .width(min: 230, ideal: 340, max: .infinity)
             .customizationID("name")
 
+            TableColumn("项目") { row in
+                if let projectName = row.projectName {
+                    Text(projectName)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(row.projectPath ?? projectName)
+                } else {
+                    Text("—")
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .width(min: 90, ideal: 125, max: 200)
+            .customizationID("project")
+
             TableColumn(
                 "Token（含子级 / 自身）",
                 sortUsing: UsageRowSortComparator(field: .totalTokens)
@@ -66,23 +80,15 @@ struct UsageTableView: View {
             .width(min: 112, ideal: 128, max: 155)
             .customizationID("cache")
 
-            TableColumn("输出") { row in
-                TokenCell(
-                    value: row.subtreeUsage.outputTokens,
+            TableColumn("输出 / 推理") { row in
+                OutputCell(
+                    output: row.subtreeUsage.outputTokens,
+                    reasoning: row.subtreeUsage.reasoningOutputTokens,
                     isApproximate: row.isUsageApproximate
                 )
             }
-            .width(min: 82, ideal: 92, max: 120)
-            .customizationID("output")
-
-            TableColumn("推理") { row in
-                TokenCell(
-                    value: row.subtreeUsage.reasoningOutputTokens,
-                    isApproximate: row.isUsageApproximate
-                )
-            }
-            .width(min: 82, ideal: 92, max: 120)
-            .customizationID("reasoning")
+            .width(min: 118, ideal: 140, max: 175)
+            .customizationID("output-reasoning")
 
             TableColumn("模型 / 档位") { row in
                 Text(row.modelSummary)
@@ -92,20 +98,14 @@ struct UsageTableView: View {
             .width(min: 130, ideal: 190, max: 280)
             .customizationID("model")
 
-            TableColumn("Credits") { row in
-                CreditsCell(estimate: row.creditEstimate, warnings: row.warnings)
-            }
-            .width(min: 120, ideal: 140, max: 175)
-            .customizationID("credits")
-
             TableColumn(
-                "API USD 等价",
+                "Credits / API USD 等价",
                 sortUsing: UsageRowSortComparator(field: .apiUSD)
             ) { row in
-                APIPriceCell(estimate: row.apiPriceEstimate, warnings: row.warnings)
+                CombinedPriceCell(row: row)
             }
-            .width(min: 130, ideal: 150, max: 185)
-            .customizationID("api-price")
+            .width(min: 150, ideal: 190, max: 250)
+            .customizationID("credits-api-price")
         }
         .tableStyle(.inset(alternatesRowBackgrounds: true))
     }
@@ -603,6 +603,26 @@ private struct CacheCell: View {
     }
 }
 
+private struct OutputCell: View {
+    let output: Int64
+    let reasoning: Int64
+    var isApproximate = false
+
+    var body: some View {
+        Text(
+            "\(qualifiedToken(output, isLowerBound: false, isApproximate: isApproximate)) / "
+                + qualifiedToken(reasoning, isLowerBound: false, isApproximate: isApproximate)
+        )
+            .monospacedDigit()
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .help(
+                "输出 \(TokenFormatter.exact(output))；推理 \(TokenFormatter.exact(reasoning))"
+                    + "（推理是输出的子集，两者不相加）"
+                    + usageQualifierHelp(isLowerBound: false, isApproximate: isApproximate)
+            )
+    }
+}
+
 private func qualifiedToken(
     _ value: Int64,
     isLowerBound: Bool,
@@ -681,6 +701,18 @@ private struct CreditsCell: View {
         case (false, true): "部分≈"
         case (false, false): "≈"
         }
+    }
+}
+
+private struct CombinedPriceCell: View {
+    let row: UsageTreeRow
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            CreditsCell(estimate: row.creditEstimate, warnings: row.warnings)
+            APIPriceCell(estimate: row.apiPriceEstimate, warnings: row.warnings)
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
     }
 }
 

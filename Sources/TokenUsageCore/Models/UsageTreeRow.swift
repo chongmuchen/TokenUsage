@@ -36,6 +36,8 @@ public struct UsageTreeRow: Identifiable, Sendable {
     public let time: Date?
     public let endTime: Date?
     public let name: String
+    public let projectName: String?
+    public let projectPath: String?
     public let ownUsage: TokenUsage
     public let subtreeUsage: TokenUsage
     public let counts: UsageCounts
@@ -73,6 +75,8 @@ public struct UsageTreeRow: Identifiable, Sendable {
         time: Date?,
         endTime: Date? = nil,
         name: String,
+        projectName: String? = nil,
+        projectPath: String? = nil,
         ownUsage: TokenUsage,
         subtreeUsage: TokenUsage,
         counts: UsageCounts,
@@ -100,6 +104,8 @@ public struct UsageTreeRow: Identifiable, Sendable {
         self.time = time
         self.endTime = endTime
         self.name = name
+        self.projectName = projectName
+        self.projectPath = projectPath
         self.ownUsage = ownUsage
         self.subtreeUsage = subtreeUsage
         self.counts = counts
@@ -128,6 +134,7 @@ public enum DatePreset: String, CaseIterable, Identifiable, Sendable {
     case today = "今天"
     case week = "最近一周"
     case month = "最近一月"
+    case limitPeriod = "本周期（额度周期）"
     case custom = "自定义"
 
     public var id: String { rawValue }
@@ -191,6 +198,9 @@ public struct UsageFilter: Equatable, Sendable {
     }
 
     public mutating func apply(_ preset: DatePreset, now: Date = Date(), calendar: Calendar = .current) {
+        // The quota period is supplied by the server-backed weekly projection;
+        // a static calendar preset cannot derive it safely.
+        guard preset != .limitPeriod else { return }
         self.preset = preset
         guard preset != .custom else { return }
         let startOfToday = calendar.startOfDay(for: now)
@@ -202,9 +212,33 @@ public struct UsageFilter: Equatable, Sendable {
             startDate = calendar.date(byAdding: .day, value: -6, to: startOfToday) ?? startOfToday
         case .month:
             startDate = calendar.date(byAdding: .day, value: -29, to: startOfToday) ?? startOfToday
+        case .limitPeriod:
+            break
         case .custom:
             break
         }
+    }
+
+    /// Applies a server quota window expressed as a half-open range. Usage is
+    /// recorded in minute buckets, so both boundaries are floored and the UI's
+    /// inclusive end picker is set to the minute immediately before reset.
+    @discardableResult
+    public mutating func applyLimitPeriod(
+        start: Date,
+        endExclusive: Date,
+        calendar: Calendar = .current
+    ) -> Bool {
+        let lower = Self.startOfMinute(start, calendar: calendar)
+        let upper = Self.startOfMinute(endExclusive, calendar: calendar)
+        guard
+            lower < upper,
+            let inclusiveEnd = calendar.date(byAdding: .minute, value: -1, to: upper)
+        else { return false }
+
+        startDate = lower
+        endDate = inclusiveEnd
+        preset = .limitPeriod
+        return true
     }
 
     public func overlapsDateRange(_ row: UsageTreeRow, calendar: Calendar = .current) -> Bool {

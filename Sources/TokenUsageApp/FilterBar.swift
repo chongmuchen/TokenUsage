@@ -5,7 +5,7 @@ struct FilterBar: View {
     @ObservedObject var viewModel: DashboardViewModel
     var showsTokenRange = true
 
-    private let presets: [DatePreset] = [.today, .week, .month]
+    private let presets: [DatePreset] = [.today, .week, .month, .limitPeriod]
 
     var body: some View {
         HStack(spacing: 14) {
@@ -15,6 +15,8 @@ struct FilterBar: View {
                         viewModel.applyPreset(preset)
                     }
                     .buttonStyle(PresetButtonStyle(isSelected: viewModel.filter.preset == preset))
+                    .disabled(preset == .limitPeriod && !viewModel.hasActiveLimitPeriod)
+                    .help(presetHelp(preset))
                 }
             }
             .accessibilityElement(children: .contain)
@@ -104,6 +106,16 @@ struct FilterBar: View {
         case .selectedRange:
             "时段用量范围"
         }
+    }
+
+    private func presetHelp(_ preset: DatePreset) -> String {
+        guard preset == .limitPeriod else { return preset.rawValue }
+        guard let period = viewModel.currentLimitPeriod else {
+            return "暂无当前 7 天额度快照；产生新的 Codex 用量并更新报告后可用。"
+        }
+        let start = period.start.formatted(date: .numeric, time: .shortened)
+        let end = period.end.formatted(date: .numeric, time: .shortened)
+        return "使用当前限额卡对应的服务端额度周期：\(start) – \(end)。"
     }
 }
 

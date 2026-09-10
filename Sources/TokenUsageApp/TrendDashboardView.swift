@@ -245,7 +245,7 @@ private struct WeeklyLimitHistoryCard: View {
     var body: some View {
         TrendCard(
             title: "历史周限额（本地近似）",
-            subtitle: "按每个服务端 7 天窗口的最后观测值线性回推；仅覆盖本地已有报告，不是自然周账单。"
+            subtitle: "按各周期最后观测值线性回推；提前重置的周期截至新周期开始，仅覆盖本地已有报告。"
         ) {
             if let computedAt {
                 Text("本地计算于 \(computedAt, format: .dateTime.hour().minute())")
@@ -281,6 +281,11 @@ private struct WeeklyLimitHistoryCard: View {
                             GridRow {
                                 HStack(spacing: 5) {
                                     Text(periodText(projection))
+                                    if projection.periodEnd < projection.snapshot.resetsAt {
+                                        Text("提前重置")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
                                     if projection.isFinalObservationStale {
                                         Image(systemName: "exclamationmark.triangle.fill")
                                             .foregroundStyle(.orange)
@@ -356,8 +361,12 @@ private struct WeeklyLimitHistoryCard: View {
     private func rowHelp(_ projection: WeeklyLimitProjection) -> String {
         var lines = [
             projection.isCompleted ? "已结束的限额周期" : "尚未结束的限额周期",
+            "周期：\(compactDateTime(projection.periodStart)) – \(compactDateTime(projection.periodEnd))",
             "最后观测：\(compactDateTime(projection.observationCutoff))"
         ]
+        if projection.periodEnd < projection.snapshot.resetsAt {
+            lines.append("因新周期开始而提前结束；原定重置：\(compactDateTime(projection.snapshot.resetsAt))")
+        }
         if !projection.warnings.isEmpty {
             lines.append(contentsOf: projection.warnings)
         }

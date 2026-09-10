@@ -437,6 +437,229 @@ func weeklyProjectedTokensSaturate() throws {
     #expect(projection.projectedFullTokens == Int64.max)
 }
 
+@Test("An early reset retains the previous weekly period and its observed usage")
+func weeklyOverviewRetainsEarlyResetHistory() throws {
+    let report = try weeklyReport(
+        generatedAt: "2026-09-10T02:00:00Z",
+        samples: [
+            weeklySample("2026-09-08T01:23:00Z", input: 8_000_000),
+            weeklySample("2026-09-08T01:24:00Z", input: 1_000_000),
+            weeklySample("2026-09-09T03:00:00Z", input: 2_000_000),
+            weeklySample("2026-09-10T00:10:00Z", input: 3_000_000),
+            weeklySample("2026-09-10T00:11:00Z", input: 8_000_000),
+            weeklySample("2026-09-10T01:50:00Z", input: 4_000_000),
+            weeklySample("2026-09-10T02:01:00Z", input: 8_000_000)
+        ],
+        snapshots: [
+            weeklySnapshot(
+                observedAt: "2026-09-07T23:00:00Z",
+                usedPercent: 90,
+                resetsAt: "2026-09-08T01:24:00Z"
+            ),
+            weeklySnapshot(
+                observedAt: "2026-09-10T00:10:00Z",
+                usedPercent: 98,
+                resetsAt: "2026-09-15T01:24:00Z"
+            ),
+            weeklySnapshot(
+                observedAt: "2026-09-10T01:49:34Z",
+                usedPercent: 0,
+                resetsAt: "2026-09-17T01:49:14Z"
+            ),
+            weeklySnapshot(
+                observedAt: "2026-09-10T02:00:00Z",
+                bucket: "primary",
+                usedPercent: 1,
+                resetsAt: "2026-09-17T01:49:27Z"
+            )
+        ]
+    )
+    let overview = try weeklyEstimator().overview(
+        reports: [report],
+        now: weeklyDate("2026-09-10T02:00:00Z")
+    )
+    let current = try #require(overview.current)
+    let history = try #require(overview.history.first)
+    let oldStart = try weeklyDate("2026-09-08T01:24:00Z")
+    let oldScheduledReset = try weeklyDate("2026-09-15T01:24:00Z")
+    let newStart = try weeklyDate("2026-09-10T01:49:27Z")
+    let newReset = try weeklyDate("2026-09-17T01:49:27Z")
+    let oldCutoff = try weeklyDate("2026-09-10T00:10:00Z")
+
+    #expect(overview.history.count == 2)
+    #expect(history.periodStart == oldStart)
+    #expect(history.periodEnd == newStart)
+    #expect(history.snapshot.resetsAt == oldScheduledReset)
+    #expect(history.observationCutoff == oldCutoff)
+    #expect(history.snapshot.usedPercent == 98)
+    #expect(history.observedTokens == 6_000_000)
+    #expect(history.currentAPIUSD == Decimal(string: "6"))
+    #expect(history.isCompleted)
+    #expect(history.observationLagToReset == 5_967)
+    #expect(!history.isFinalObservationStale)
+    #expect(!history.warnings.contains { $0.contains("最终使用可能不完整") })
+    #expect(overview.history.last?.periodEnd == oldStart)
+    #expect(current.periodStart == newStart)
+    #expect(current.periodEnd == newReset)
+    #expect(current.snapshot.usedPercent == 1)
+    #expect(current.observedTokens == 4_000_000)
+    #expect(current.currentAPIUSD == Decimal(string: "4"))
+    #expect(!current.isCompleted)
+}
+
+@Test("Reset jitter alone never ends an active weekly period")
+func weeklyOverviewDoesNotTreatResetJitterAsEarlyReset() throws {
+    let report = try weeklyReport(
+        samples: [],
+        snapshots: [
+            weeklySnapshot(
+                observedAt: "2026-08-20T10:00:00Z",
+                bucket: "primary",
+                usedPercent: 20,
+                resetsAt: "2026-08-24T00:00:00Z"
+            ),
+            weeklySnapshot(
+                observedAt: "2026-08-20T11:00:00Z",
+                bucket: "secondary",
+                usedPercent: 21,
+                resetsAt: "2026-08-24T00:00:28Z"
+            )
+        ]
+    )
+    let overview = try weeklyEstimator().overview(
+        reports: [report],
+        now: weeklyDate("2026-08-20T12:00:00Z")
+    )
+    let current = try #require(overview.current)
+    let expectedReset = try weeklyDate("2026-08-24T00:00:28Z")
+
+    #expect(overview.history.isEmpty)
+    #expect(current.snapshot.usedPercent == 21)
+    #expect(current.periodEnd == expectedReset)
+    #expect(!current.isCompleted)
+}
+
+@Test("A slightly early natural rollover keeps the original historical reset")
+func weeklyOverviewPreservesNaturalResetDespiteJitter() throws {
+    let report = try weeklyReport(
+        samples: [],
+        snapshots: [
+            weeklySnapshot(
+                observedAt: "2026-08-16T23:00:00Z",
+                usedPercent: 95,
+                resetsAt: "2026-08-17T00:00:28Z"
+            ),
+            weeklySnapshot(
+                observedAt: "2026-08-20T11:00:00Z",
+                usedPercent: 20,
+                resetsAt: "2026-08-24T00:00:00Z"
+            )
+        ]
+    )
+    let overview = try weeklyEstimator().overview(
+        reports: [report],
+        now: weeklyDate("2026-08-20T12:00:00Z")
+    )
+    let history = try #require(overview.history.first)
+
+    #expect(overview.history.count == 1)
+    #expect(history.periodEnd == history.snapshot.resetsAt)
+    #expect(history.observationLagToReset == 3_628)
+}
+
+@Test("Another limit ID cannot end the Codex weekly period")
+func weeklyOverviewDoesNotMixLimitIDsWhenInferringEarlyResets() throws {
+    let report = try weeklyReport(
+        samples: [],
+        snapshots: [
+            weeklySnapshot(
+                observedAt: "2026-09-09T12:00:00Z",
+                usedPercent: 98,
+                resetsAt: "2026-09-15T01:24:00Z"
+            ),
+            weeklySnapshot(
+                observedAt: "2026-09-10T02:00:00Z",
+                limitId: "other",
+                usedPercent: 1,
+                resetsAt: "2026-09-17T01:49:00Z"
+            )
+        ]
+    )
+    let overview = try weeklyEstimator().overview(
+        reports: [report],
+        now: weeklyDate("2026-09-10T02:00:00Z")
+    )
+    let current = try #require(overview.current)
+
+    #expect(overview.history.isEmpty)
+    #expect(current.snapshot.limitId == "codex")
+    #expect(current.snapshot.usedPercent == 98)
+    #expect(current.periodEnd == current.snapshot.resetsAt)
+}
+
+@Test("Conflicting old snapshots and stale buckets cannot falsely close a current period",
+      arguments: ["2026-09-10T01:40:00Z", "2026-09-10T02:10:00Z"])
+func weeklyOverviewDoesNotInferEarlyResetAcrossConflictingObservations(
+    laterResetObservedAt: String
+) throws {
+    let report = try weeklyReport(
+        samples: [],
+        snapshots: [
+            weeklySnapshot(
+                observedAt: "2026-09-10T02:00:00Z",
+                bucket: "secondary",
+                usedPercent: 98,
+                resetsAt: "2026-09-15T01:24:00Z"
+            ),
+            weeklySnapshot(
+                observedAt: laterResetObservedAt,
+                bucket: "primary",
+                usedPercent: 1,
+                resetsAt: "2026-09-17T01:30:00Z"
+            )
+        ]
+    )
+    let overview = try weeklyEstimator().overview(
+        reports: [report],
+        now: weeklyDate("2026-09-10T03:00:00Z")
+    )
+    let current = try #require(overview.current)
+
+    #expect(overview.history.isEmpty)
+    #expect(current.snapshot.bucket == (laterResetObservedAt == "2026-09-10T01:40:00Z"
+        ? "secondary" : "primary"))
+    #expect(current.periodEnd == current.snapshot.resetsAt)
+    #expect(!current.isCompleted)
+}
+
+@Test("Early reset history measures stale observation warnings against its actual end")
+func weeklyOverviewEarlyResetStalenessUsesEffectiveEnd() throws {
+    let report = try weeklyReport(
+        samples: [],
+        snapshots: [
+            weeklySnapshot(
+                observedAt: "2026-09-09T18:49:00Z",
+                usedPercent: 98,
+                resetsAt: "2026-09-15T01:24:00Z"
+            ),
+            weeklySnapshot(
+                observedAt: "2026-09-10T02:00:00Z",
+                usedPercent: 1,
+                resetsAt: "2026-09-17T01:49:00Z"
+            )
+        ]
+    )
+    let overview = try weeklyEstimator().overview(
+        reports: [report],
+        now: weeklyDate("2026-09-10T02:00:00Z")
+    )
+    let history = try #require(overview.history.first)
+
+    #expect(history.isFinalObservationStale)
+    #expect(history.observationLagToReset == 7 * 60 * 60)
+    #expect(history.warnings.contains { $0.contains("距离重置约 7 小时") })
+}
+
 private func weeklyEstimator() throws -> WeeklyLimitEstimator {
     WeeklyLimitEstimator(catalog: try weeklyCatalog(), calendar: weeklyCalendar())
 }

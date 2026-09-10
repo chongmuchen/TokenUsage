@@ -36,6 +36,7 @@ public enum WeeklyLimitConfidence: String, Codable, CaseIterable, Sendable {
 public struct WeeklyLimitProjection: Equatable, Sendable {
     public let snapshot: RateLimitSnapshot
     public let periodStart: Date
+    public let periodEnd: Date
     public let apiUSD: UsageTrendPriceSummary
     public let currentAPIUSD: Decimal?
     public let projectedAPIUSD: Decimal?
@@ -48,6 +49,7 @@ public struct WeeklyLimitProjection: Equatable, Sendable {
     public init(
         snapshot: RateLimitSnapshot,
         periodStart: Date,
+        periodEnd: Date? = nil,
         apiUSD: UsageTrendPriceSummary,
         currentAPIUSD: Decimal?,
         projectedAPIUSD: Decimal?,
@@ -59,6 +61,7 @@ public struct WeeklyLimitProjection: Equatable, Sendable {
     ) {
         self.snapshot = snapshot
         self.periodStart = periodStart
+        self.periodEnd = periodEnd ?? snapshot.resetsAt
         self.apiUSD = apiUSD
         self.currentAPIUSD = currentAPIUSD
         self.projectedAPIUSD = projectedAPIUSD
@@ -71,7 +74,6 @@ public struct WeeklyLimitProjection: Equatable, Sendable {
 
     public var observedTokens: Int64 { apiUSD.totalTokens }
     public var observationCutoff: Date { snapshot.observedAt }
-    public var periodEnd: Date { snapshot.resetsAt }
     public var projectedFullAPIUSD: Decimal? { projectedAPIUSD }
     public var observationLagToReset: TimeInterval {
         max(periodEnd.timeIntervalSince(observationCutoff), 0)
@@ -134,7 +136,7 @@ public struct WeeklyLimitEstimator: Sendable {
         let activeClusters = clusters.filter { cluster in
             let snapshot = cluster.snapshot
             let periodStart = weeklyPeriodStart(for: snapshot)
-            return periodStart <= now && snapshot.resetsAt > now
+            return periodStart <= now && cluster.periodEnd > now
         }
         let currentCluster = preferredCluster(in: activeClusters)
         let selectedLimitID = currentCluster?.snapshot.limitId
@@ -143,7 +145,7 @@ public struct WeeklyLimitEstimator: Sendable {
 
         let current = currentCluster.map {
             projection(
-                for: $0.snapshot,
+                for: $0,
                 reports: newestReports,
                 now: now,
                 duplicateRootCount: duplicateRootCount
@@ -154,7 +156,7 @@ public struct WeeklyLimitEstimator: Sendable {
             let historicalClusters = clusters
                 .filter {
                     $0.snapshot.limitId == selectedLimitID
-                        && $0.snapshot.resetsAt <= now
+                        && $0.periodEnd <= now
                 }
                 .sorted(by: clusterNewestFirst)
                 .prefix(boundedHistoryLimit)
@@ -162,7 +164,7 @@ public struct WeeklyLimitEstimator: Sendable {
                 guard !Task.isCancelled else { break }
                 history.append(
                     projection(
-                        for: cluster.snapshot,
+                        for: cluster,
                         reports: newestReports,
                         now: now,
                         duplicateRootCount: duplicateRootCount
@@ -175,11 +177,12 @@ public struct WeeklyLimitEstimator: Sendable {
     }
 
     private func projection(
-        for snapshot: RateLimitSnapshot,
+        for cluster: WeeklySnapshotCluster,
         reports: [UsageReport],
         now: Date,
         duplicateRootCount: Int
     ) -> WeeklyLimitProjection {
+        let snapshot = cluster.snapshot
         let periodStart = weeklyPeriodStart(for: snapshot)
 
         let trend = trendAggregator.aggregate(
@@ -227,8 +230,8 @@ public struct WeeklyLimitEstimator: Sendable {
         if apiUSD.isSuppressed {
             warnings.append("本周期部分价格因数据一致性问题被抑制。")
         }
-        let isCompleted = snapshot.resetsAt <= now
-        let observationLag = snapshot.resetsAt.timeIntervalSince(snapshot.observedAt)
+        let isCompleted = cluster.periodEnd <= now
+        let observationLag = cluster.periodEnd.timeIntervalSince(snapshot.observedAt)
         if isCompleted, observationLag > Self.staleObservationThreshold {
             warnings.append(
                 "历史周期最后观测距离重置约 \(observationLagText(observationLag))，最终使用可能不完整。"
@@ -241,6 +244,7 @@ public struct WeeklyLimitEstimator: Sendable {
         return WeeklyLimitProjection(
             snapshot: snapshot,
             periodStart: periodStart,
+            periodEnd: cluster.periodEnd,
             apiUSD: apiUSD,
             currentAPIUSD: currentAPIUSD,
             projectedAPIUSD: projectedAPIUSD,
@@ -309,7 +313,37 @@ public struct WeeklyLimitEstimator: Sendable {
                     )
                 }
             }
-            return clusters
+            return endingSupersededPeriods(in: clusters)
+        }
+    }
+
+    private func endingSupersededPeriods(
+        in clusters: [WeeklySnapshotCluster]
+    ) -> [WeeklySnapshotCluster] {
+        // All clusters here belong to one limit ID. A newly observed weekly
+        // window can begin before the previous scheduled reset (for example,
+        // after redeeming a reset). Preserve that previous window as history
+        // without changing the server's original reset or percentage snapshot.
+        clusters.map { cluster in
+            let periodStart = weeklyPeriodStart(for: cluster.snapshot)
+            let earlyResetAt = clusters.compactMap { successor -> Date? in
+                let successorStart = weeklyPeriodStart(for: successor.snapshot)
+                // A conflicting observation after the inferred boundary is
+                // not evidence that this period ended. Keep the usual latest
+                // snapshot selection in that case, even across bucket names.
+                guard
+                    successorStart.timeIntervalSince(periodStart)
+                        > Self.resetClusteringTolerance,
+                    cluster.snapshot.resetsAt.timeIntervalSince(successorStart)
+                        > Self.resetClusteringTolerance,
+                    cluster.snapshot.observedAt <= successorStart,
+                    cluster.snapshot.observedAt < successor.snapshot.observedAt
+                else { return nil }
+                return successorStart
+            }.min()
+            var result = cluster
+            result.earlyResetAt = earlyResetAt
+            return result
         }
     }
 
@@ -326,8 +360,8 @@ public struct WeeklyLimitEstimator: Sendable {
         _ lhs: WeeklySnapshotCluster,
         _ rhs: WeeklySnapshotCluster
     ) -> Bool {
-        if lhs.snapshot.resetsAt != rhs.snapshot.resetsAt {
-            return lhs.snapshot.resetsAt > rhs.snapshot.resetsAt
+        if lhs.periodEnd != rhs.periodEnd {
+            return lhs.periodEnd > rhs.periodEnd
         }
         return snapshotLessThan(rhs.snapshot, lhs.snapshot)
     }
@@ -396,4 +430,7 @@ public struct WeeklyLimitEstimator: Sendable {
 private struct WeeklySnapshotCluster: Sendable {
     let anchorResetsAt: Date
     var snapshot: RateLimitSnapshot
+    var earlyResetAt: Date? = nil
+
+    var periodEnd: Date { earlyResetAt ?? snapshot.resetsAt }
 }

@@ -283,7 +283,8 @@ private struct WeeklyLimitHistoryCard: View {
                 ScrollView(.horizontal) {
                     Grid(alignment: .trailing, horizontalSpacing: 18, verticalSpacing: 8) {
                         GridRow {
-                            header("周期", alignment: .leading)
+                            header("周期")
+                                .gridColumnAlignment(.leading)
                             header("100% API USD")
                             header("100% Token 等价")
                             header("最后观测实际 API USD")
@@ -298,6 +299,7 @@ private struct WeeklyLimitHistoryCard: View {
                             GridRow {
                                 HStack(spacing: 5) {
                                     Text(periodText(projection))
+                                        .monospacedDigit()
                                     if projection.periodEnd < projection.snapshot.resetsAt {
                                         Text("提前重置")
                                             .font(.caption)
@@ -308,7 +310,7 @@ private struct WeeklyLimitHistoryCard: View {
                                             .foregroundStyle(.orange)
                                     }
                                 }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                .fixedSize(horizontal: true, vertical: false)
                                 value(priceText(projection.projectedAPIUSD, projection: projection))
                                 value(projectedTokenText(projection.projectedFullTokens))
                                 value(priceText(projection.currentAPIUSD, projection: projection))
@@ -320,24 +322,24 @@ private struct WeeklyLimitHistoryCard: View {
                         }
                     }
                     .font(.callout)
+                    .fixedSize(horizontal: true, vertical: false)
                     .frame(minWidth: 1_120)
                 }
             }
         }
     }
 
-    private func header(_ text: String, alignment: Alignment = .trailing) -> some View {
+    private func header(_ text: String) -> some View {
         Text(text)
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: alignment)
+            .fixedSize(horizontal: true, vertical: false)
     }
 
     private func value(_ text: String) -> some View {
         Text(text)
             .monospacedDigit()
-            .lineLimit(1)
-            .frame(maxWidth: .infinity, alignment: .trailing)
+            .fixedSize(horizontal: true, vertical: false)
     }
 
     private func priceText(

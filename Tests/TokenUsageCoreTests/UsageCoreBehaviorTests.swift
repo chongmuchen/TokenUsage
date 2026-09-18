@@ -795,6 +795,16 @@ func historicalSyncRefreshPolicy() throws {
         currentCatalogID: "current-catalog"
     ))
     #expect(HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(usageAccountingVersion: nil, forked: true),
+        expectedRootID: "session-root",
+        currentCatalogID: "current-catalog"
+    ))
+    #expect(!HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(usageAccountingVersion: nil),
+        expectedRootID: "session-root",
+        currentCatalogID: "current-catalog"
+    ))
+    #expect(HistoricalReportGenerator.needsRefresh(
         report: try historicalPolicyReport(isLowerBound: true),
         expectedRootID: "session-root",
         currentCatalogID: "current-catalog"
@@ -1075,6 +1085,8 @@ private func historicalPolicyReport(
     hasUsageSamples: Bool = true,
     hasRateLimitSnapshots: Bool = true,
     hasRateLimitObservations: Bool = true,
+    usageAccountingVersion: Int? = 2,
+    forked: Bool = false,
     isLowerBound: Bool = false,
     costSuppressed: Bool = false,
     reportCatalogID: String = "current-catalog",
@@ -1098,6 +1110,11 @@ private func historicalPolicyReport(
         object["rate_limit_observations"] = []
     } else {
         object.removeValue(forKey: "rate_limit_observations")
+    }
+    object["usage_accounting_version"] = usageAccountingVersion
+    if forked, var threads = object["threads"] as? [[String: Any]], !threads.isEmpty {
+        threads[0]["forked_from_id"] = "parent-session"
+        object["threads"] = threads
     }
     task["usage_is_lower_bound"] = isLowerBound
     task["cost"] = [

@@ -67,6 +67,84 @@ func parserDoesNotDoubleCountMonotonicCrossTaskCounters() throws {
     #expect(rawUsage["total_tokens"] as? Int == 170)
 }
 
+@Test("Forked session excludes inherited cumulative tokens from its first request")
+func parserExcludesInheritedForkCounter() throws {
+    let state = try runParserEpochRecords([
+        epochSessionMeta(forkedFrom: "01a08aae-0d7d-74d2-b827-7a3b3a43ec4b"),
+        epochTaskStarted("01a0a5b2-161d-7af3-b678-58af4c2c24d8", at: "2026-09-15T15:31:46Z"),
+        [
+            "timestamp": "2026-09-15T15:31:47Z",
+            "type": "turn_context",
+            "payload": ["turn_id": "01a0a5b2-161d-7af3-b678-58af4c2c24d8", "model": "gpt-5.6-sol"]
+        ],
+        epochTokenCount(
+            input: 94_826_970, output: 254_572, at: "2026-09-15T15:31:58Z",
+            cachedInput: 92_797_184, reasoningOutput: 73_255,
+            lastUsage: [
+                "input_tokens": 211_195, "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0, "output_tokens": 290,
+                "reasoning_output_tokens": 119, "total_tokens": 211_485
+            ]
+        ),
+        epochTokenCount(
+            input: 95_038_477, output: 254_668, at: "2026-09-15T15:32:04Z",
+            cachedInput: 93_008_256, reasoningOutput: 73_255
+        )
+    ], includeSummary: true)
+
+    let rawUsage = try #require(state["raw_usage"] as? [String: Any])
+    #expect(rawUsage["input_tokens"] as? Int == 422_702)
+    #expect(rawUsage["output_tokens"] as? Int == 386)
+    #expect(rawUsage["total_tokens"] as? Int == 423_088)
+    #expect(state["cache_schema_version"] as? Int == 16)
+    let samples = try #require(state["usage_samples"] as? [[String: Any]])
+    let firstSample = try #require(samples.first)
+    let firstUsage = try #require(firstSample["usage"] as? [String: Any])
+    #expect(firstUsage["total_tokens"] as? Int == 211_485)
+    #expect(firstSample["long_context"] as? Bool == false)
+    let summary = try #require(state["_test_summary"] as? [String: Any])
+    let ownedUsage = try #require(summary["usage"] as? [String: Any])
+    #expect(ownedUsage["total_tokens"] as? Int == 423_088)
+    #expect(summary["exclusive_usage_available"] as? Bool == true)
+}
+
+@Test("Forked session with no reliable first request leaves an explicit lower bound")
+func parserDoesNotPriceAmbiguousForkCounter() throws {
+    let state = try runParserEpochRecords([
+        epochSessionMeta(forkedFrom: "01a08aae-0d7d-74d2-b827-7a3b3a43ec4b"),
+        epochTaskStarted("01a0a5b2-161d-7af3-b678-58af4c2c24d8", at: "2026-09-15T15:31:46Z"),
+        epochTokenCount(
+            input: 95_000_000, output: 100_000, at: "2026-09-15T15:31:58Z",
+            lastUsage: ["total_tokens": 2_000]
+        ),
+        epochTokenCount(input: 95_001_000, output: 100_020, at: "2026-09-15T15:32:04Z")
+    ], includeSummary: true)
+
+    let rawUsage = try #require(state["raw_usage"] as? [String: Any])
+    #expect(rawUsage["total_tokens"] as? Int == 1_020)
+    let summary = try #require(state["_test_summary"] as? [String: Any])
+    let warnings = try #require(summary["warnings"] as? [String])
+    #expect(warnings.contains { $0.contains("first token increment was unavailable") })
+}
+
+@Test("Missing first counter in a copied fork prefix does not taint owned usage")
+func parserKeepsForkPrefixWarningOutOfOwnedTurn() throws {
+    let state = try runParserEpochRecords([
+        epochSessionMeta(forkedFrom: "01a08aae-0d7d-74d2-b827-7a3b3a43ec4b"),
+        epochTaskStarted("01a08aae-f051-7b09-bbac-c388b7c7f127", at: "2026-09-10T09:00:00Z"),
+        epochTokenCount(input: 95_000_000, output: 100_000, at: "2026-09-10T09:00:01Z"),
+        epochTaskComplete("01a08aae-f051-7b09-bbac-c388b7c7f127", at: "2026-09-10T09:00:02Z"),
+        epochTaskStarted("01a0a5b2-161d-7af3-b678-58af4c2c24d8", at: "2026-09-15T15:31:46Z"),
+        epochTokenCount(input: 95_001_000, output: 100_020, at: "2026-09-15T15:31:58Z")
+    ], includeSummary: true)
+
+    let summary = try #require(state["_test_summary"] as? [String: Any])
+    let ownedUsage = try #require(summary["usage"] as? [String: Any])
+    #expect(ownedUsage["total_tokens"] as? Int == 1_020)
+    let warnings = try #require(summary["warnings"] as? [String])
+    #expect(!warnings.contains { $0.contains("first token increment was unavailable") })
+}
+
 @Test("Parser captures both rate-limit buckets even when token usage does not change")
 func parserCapturesRateLimitsBeforeZeroDeltaReturn() throws {
     let limits = epochRateLimits(primaryUsed: 7.5, secondaryUsed: 28)
@@ -201,7 +279,9 @@ func parserMergesRateLimitSnapshotsAcrossThreads() throws {
     #expect(snapshots[2]["used_percent"] as? Int == 3)
 }
 
-private func runParserEpochRecords(_ records: [[String: Any]]) throws -> [String: Any] {
+private func runParserEpochRecords(
+    _ records: [[String: Any]], includeSummary: Bool = false
+) throws -> [String: Any] {
     let script = try #require(
         TokenUsageResources.url(forResource: "token_usage", withExtension: "py")
     )
@@ -220,12 +300,14 @@ private func runParserEpochRecords(_ records: [[String: Any]]) throws -> [String
         for record in json.loads(sys.argv[2]):
             state["record_sequence"] += 1
             ns["_process_record"](state, record)
+        if sys.argv[3] == "1":
+            state["_test_summary"] = ns["_thread_summary"](state["thread_id"], state, {}, None, None)
         print(json.dumps(state))
         """
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-    process.arguments = ["-c", code, script.path, recordsJSON]
+    process.arguments = ["-c", code, script.path, recordsJSON, includeSummary ? "1" : "0"]
     var environment = ProcessInfo.processInfo.environment
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     process.environment = environment
@@ -302,6 +384,17 @@ private func epochTaskStarted(_ turnID: String, at timestamp: String) -> [String
     ]
 }
 
+private func epochSessionMeta(forkedFrom parentID: String) -> [String: Any] {
+    [
+        "timestamp": "2026-09-15T15:30:46Z",
+        "type": "session_meta",
+        "payload": [
+            "id": "01a0a5b1-2bb9-79d2-bfd9-a14a74b137a2",
+            "forked_from_id": parentID
+        ]
+    ]
+}
+
 private func epochTaskComplete(_ turnID: String, at timestamp: String) -> [String: Any] {
     [
         "timestamp": timestamp,
@@ -314,20 +407,27 @@ private func epochTokenCount(
     input: Int,
     output: Int,
     at timestamp: String,
-    rateLimits: [String: Any]? = nil
+    rateLimits: [String: Any]? = nil,
+    cachedInput: Int = 0,
+    reasoningOutput: Int = 0,
+    lastUsage: [String: Int]? = nil
 ) -> [String: Any] {
+    var info: [String: Any] = [
+        "total_token_usage": [
+            "input_tokens": input,
+            "cached_input_tokens": cachedInput,
+            "cache_write_input_tokens": 0,
+            "output_tokens": output,
+            "reasoning_output_tokens": reasoningOutput,
+            "total_tokens": input + output
+        ]
+    ]
+    if let lastUsage {
+        info["last_token_usage"] = lastUsage
+    }
     var payload: [String: Any] = [
         "type": "token_count",
-        "info": [
-            "total_token_usage": [
-                "input_tokens": input,
-                "cached_input_tokens": 0,
-                "cache_write_input_tokens": 0,
-                "output_tokens": output,
-                "reasoning_output_tokens": 0,
-                "total_tokens": input + output
-            ]
-        ]
+        "info": info
     ]
     if let rateLimits {
         payload["rate_limits"] = rateLimits

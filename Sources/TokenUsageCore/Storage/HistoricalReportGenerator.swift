@@ -228,6 +228,10 @@ public actor HistoricalReportGenerator {
         guard report.task.usageSamples != nil else { return true }
         guard report.rateLimitSnapshots != nil else { return true }
         guard report.rateLimitObservations != nil else { return true }
+        if report.threads.contains(where: { $0.forkedFromId != nil }),
+           (report.usageAccountingVersion ?? 0) < 2 {
+            return true
+        }
         guard !report.task.usageIsLowerBound else { return true }
         guard report.task.cost.costSuppressed != true else { return true }
 

@@ -481,6 +481,9 @@ public struct RateLimitSnapshot: Codable, Equatable, Hashable, Sendable {
 
 public struct UsageReport: Codable, Equatable, Identifiable, Sendable {
     public let reportSchemaVersion: Int
+    /// Accounting revision within report schema v1. Older fork reports may
+    /// include their parent's cumulative token counter as new usage.
+    public let usageAccountingVersion: Int?
     public let generatedAt: Date
     public let rootThreadId: String
     /// Optional producer-supplied label for reports whose ephemeral thread has

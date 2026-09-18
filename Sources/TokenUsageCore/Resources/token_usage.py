@@ -32,7 +32,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 
-CACHE_SCHEMA_VERSION = 15
+CACHE_SCHEMA_VERSION = 16
 RATE_LIMIT_RESET_JITTER_SECONDS = 300
 CHECKPOINT_BYTES = 4096
 REPORT_SCHEMA_VERSION = 1
@@ -212,6 +212,35 @@ def _usage_delta(current: Dict[str, int], previous: Dict[str, int]) -> Tuple[Dic
     total_mismatch = bool(delta["total_tokens"] and delta["total_tokens"] != expected_total)
     delta["total_tokens"] = expected_total
     return delta, reset, total_mismatch
+
+
+def _first_fork_usage(info: Dict[str, Any], current: Dict[str, int]) -> Optional[Dict[str, int]]:
+    """Use the first request's own counters instead of a fork's inherited total.
+
+    A fork can start with cumulative counters copied from its parent while its
+    transcript contains no parent token samples. The first total is therefore
+    not a delta from zero. `last_token_usage` is the request-local increment,
+    but only a complete, internally consistent value can safely be priced.
+    """
+    if not any(current.values()):
+        return _zero_usage()
+    value = info.get("last_token_usage")
+    if not isinstance(value, dict) or any(
+        field not in value or isinstance(value[field], bool)
+        or not isinstance(value[field], int) or value[field] < 0
+        for field in USAGE_FIELDS
+    ):
+        return None
+    usage = _usage_from(value)
+    if usage["total_tokens"] != usage["input_tokens"] + usage["output_tokens"]:
+        return None
+    if usage["cached_input_tokens"] + usage["cache_write_input_tokens"] > usage["input_tokens"]:
+        return None
+    if usage["reasoning_output_tokens"] > usage["output_tokens"]:
+        return None
+    if any(usage[field] > current[field] for field in USAGE_FIELDS):
+        return None
+    return usage
 
 
 def _iso_to_epoch(value: Any) -> Optional[float]:
@@ -676,6 +705,8 @@ def _new_parser_state(transcript_path: Path, stat_result: os.stat_result) -> Dic
         "settings": {"model": None, "effort": None, "tier": None},
         "last_total_usage": _zero_usage(),
         "last_total_usage_task_epoch": 0,
+        "total_usage_sample_seen": False,
+        "first_fork_sample_unavailable_epoch": None,
         "raw_usage": _zero_usage(),
         "raw_counts": _zero_counts(),
         "seen_call_hashes": {},
@@ -1061,7 +1092,23 @@ def _process_record(state: Dict[str, Any], record: Dict[str, Any]) -> None:
         first_sample_in_task_epoch = (
             _as_int(state.get("last_total_usage_task_epoch")) != sample_task_epoch
         )
-        delta, reset, mismatch = _usage_delta(current, previous)
+        first_fork_sample = bool(state.get("forked_from_id")) and not state.get("total_usage_sample_seen")
+        if first_fork_sample:
+            # The fork transcript may begin after an inherited parent prefix.
+            # Its first cumulative total can be enormous even if this task
+            # has made only one request. Keep `current` as the baseline for
+            # subsequent requests, and account for only the request-local
+            # first increment when it is complete and credible.
+            first_usage = _first_fork_usage(info, current)
+            if first_usage is None:
+                delta = _zero_usage()
+                state["first_fork_sample_unavailable_epoch"] = sample_task_epoch
+            else:
+                delta = first_usage
+            reset = False
+            mismatch = False
+        else:
+            delta, reset, mismatch = _usage_delta(current, previous)
         if reset and first_sample_in_task_epoch:
             # Codex may restart its cumulative counters when a new task begins.
             # The first sample in that task is then the complete epoch-local
@@ -1074,6 +1121,7 @@ def _process_record(state: Dict[str, Any], record: Dict[str, Any]) -> None:
             return
         state["last_total_usage"] = current
         state["last_total_usage_task_epoch"] = sample_task_epoch
+        state["total_usage_sample_seen"] = True
         if mismatch:
             _append_warning(state, "a token delta had total_tokens != input_tokens + output_tokens")
         if not delta["total_tokens"]:
@@ -1599,6 +1647,13 @@ def _thread_summary(
         inherited_counts = _zero_counts()
     counts, negative_counts = _counts_difference(raw_counts, inherited_counts)
     warnings = list(state.get("warnings") or []) + boundary_warnings
+    first_fork_sample_unavailable_epoch = state.get("first_fork_sample_unavailable_epoch")
+    if (
+        isinstance(first_fork_sample_unavailable_epoch, int)
+        and boundary is not None
+        and first_fork_sample_unavailable_epoch >= _as_int(boundary.get("task_epoch"))
+    ):
+        warnings.append("forked session first token increment was unavailable; usage is a lower bound")
     segment_usage = _sum_usage(segment.get("usage", {}) for segment in owned_segments)
     if segment_usage != exclusive_usage:
         warnings.append("exclusive usage/segment reconciliation failed; price estimates are incomplete")
@@ -2198,6 +2253,7 @@ def build_report(
         "reconciliation failed",
         "boundary could not be resolved",
         "baseline exceeded",
+        "first token increment was unavailable",
     )
     severe_warnings = [
         warning
@@ -2226,6 +2282,7 @@ def build_report(
 
     report = {
         "report_schema_version": REPORT_SCHEMA_VERSION,
+        "usage_accounting_version": 2,
         "generated_at": _now_iso(),
         "root_thread_id": root_id,
         "selected_turn_id": turn_id,

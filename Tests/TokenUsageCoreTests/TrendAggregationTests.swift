@@ -99,6 +99,46 @@ func trendLocalMidnightAndZeroDays() throws {
     #expect(result.series.first?.summary.tokens.totalTokens == 30)
 }
 
+@Test("Current quota period charts stop at today while retaining the reset date")
+func trendLimitPeriodOmitsFutureZeroDays() throws {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = try #require(TimeZone(identifier: "Asia/Shanghai"))
+    let now = try trendDate("2026-09-18T13:30:00Z")
+    let reset = try trendDate("2026-09-19T09:15:00Z")
+    var filter = UsageFilter(now: now, calendar: calendar)
+    #expect(filter.applyLimitPeriod(
+        start: try trendDate("2026-09-12T09:15:00Z"),
+        endExclusive: reset,
+        calendar: calendar
+    ))
+
+    let report = try trendReport(samples: [
+        trendSample(
+            "2026-09-18T10:00:00Z",
+            model: "gpt-5.6-sol",
+            effort: "medium",
+            tier: "default",
+            usage: trendUsage(input: 10)
+        )
+    ], generatedAt: "2026-09-18T12:00:00Z")
+    let result = UsageTrendAggregator(catalog: try PricingCatalog.bundled(), calendar: calendar)
+        .aggregate(
+            reports: [report],
+            filter: UsageTrendFilter(
+                startMinute: filter.startDate,
+                endMinute: filter.chartEndDate(now: now)
+            )
+        )
+
+    #expect(calendar.component(.day, from: filter.endDate) == 19)
+    #expect(result.days.count == 7)
+    #expect(result.days.last == calendar.startOfDay(for: now))
+    #expect(result.series.first?.points.last?.aggregate.tokens.totalTokens == 10)
+
+    filter.preset = .custom
+    #expect(filter.chartEndDate(now: now) == filter.endDate)
+}
+
 @Test("Trend normalizes model aliases and Standard/Fast filters before grouping")
 func trendConfigurationFilteringAndGrouping() throws {
     let report = try trendReport(samples: [

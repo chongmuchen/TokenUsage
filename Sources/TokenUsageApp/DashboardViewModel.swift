@@ -129,7 +129,7 @@ final class DashboardViewModel: ObservableObject {
             reports: reports,
             filter: UsageTrendFilter(
                 startMinute: filter.startDate,
-                endMinute: filter.endDate,
+                endMinute: filter.chartEndDate(),
                 selectedModels: selectedTrendModels,
                 selectedEfforts: selectedTrendEfforts,
                 selectedSpeeds: selectedTrendSpeeds,
@@ -149,7 +149,7 @@ final class DashboardViewModel: ObservableObject {
         guard let dailyQuotaTrend else { return [] }
         let calendar = Calendar.current
         let lower = calendar.startOfDay(for: min(filter.startDate, filter.endDate))
-        let upper = calendar.startOfDay(for: max(filter.startDate, filter.endDate))
+        let upper = calendar.startOfDay(for: max(filter.startDate, filter.chartEndDate()))
         return dailyQuotaTrend.points.filter { $0.day >= lower && $0.day <= upper }
     }
 

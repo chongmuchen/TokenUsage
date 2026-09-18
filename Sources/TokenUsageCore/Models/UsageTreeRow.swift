@@ -241,6 +241,12 @@ public struct UsageFilter: Equatable, Sendable {
         return true
     }
 
+    /// Keep the quota reset time in the picker, but stop daily charts at the
+    /// current moment instead of filling future days with zeroes.
+    public func chartEndDate(now: Date = Date()) -> Date {
+        preset == .limitPeriod ? min(endDate, now) : endDate
+    }
+
     public func overlapsDateRange(_ row: UsageTreeRow, calendar: Calendar = .current) -> Bool {
         guard row.kind == .session, let start = row.time else { return false }
         let (lower, upper) = minuteRange(calendar: calendar)

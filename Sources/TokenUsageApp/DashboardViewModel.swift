@@ -8,6 +8,11 @@ private struct LoadedUsageCandidate: Sendable {
     let report: UsageReport
 }
 
+private struct HomeUsageReportGroup: Sendable {
+    let home: CodexHome
+    let reports: [UsageReport]
+}
+
 private struct ReportFileFingerprint: Equatable {
     let name: String
     let resourceIdentifier: String?
@@ -40,6 +45,8 @@ final class DashboardViewModel: ObservableObject {
     @Published var selectedTrendEfforts: Set<String> = []
     @Published var selectedTrendSpeeds: Set<UsageTrendSpeed> = []
     @Published private(set) var weeklyLimitOverview: WeeklyLimitOverview?
+    @Published private(set) var dailyQuotaTrend: DailyQuotaTrend?
+    @Published private(set) var dailyQuotaHomeName: String?
 
     private let repository = ReportRepository()
     private let titleStore = ThreadTitleStore()
@@ -48,6 +55,7 @@ final class DashboardViewModel: ObservableObject {
     private let builder: UsageTreeBuilder
     private let trendAggregator: UsageTrendAggregator
     private let weeklyLimitEstimator: WeeklyLimitEstimator
+    private let dailyQuotaAggregator: DailyQuotaTrendAggregator
     private var monitors: [String: ReportDirectoryMonitor] = [:]
     private var securityScopedURLs: [UUID: URL] = [:]
     private var loadGeneration = 0
@@ -70,6 +78,7 @@ final class DashboardViewModel: ObservableObject {
         self.builder = UsageTreeBuilder(catalog: catalog)
         self.trendAggregator = UsageTrendAggregator(catalog: catalog)
         self.weeklyLimitEstimator = WeeklyLimitEstimator(catalog: catalog)
+        self.dailyQuotaAggregator = DailyQuotaTrendAggregator(catalog: catalog)
         self.homes = homes
         self.selectedRoot = homes.first(where: \.isActive)?.rootURL
             ?? homes.first(where: \.isAvailable)?.rootURL
@@ -132,6 +141,23 @@ final class DashboardViewModel: ObservableObject {
     var trendModelOptions: [UsageTrendModelOption] { unfilteredTrendDimensions.models }
     var trendEffortOptions: [String] { unfilteredTrendDimensions.efforts }
     var trendSpeedOptions: [UsageTrendSpeed] { unfilteredTrendDimensions.speeds }
+
+    /// Quota figures stay on the same Codex Home as the weekly-limit card.
+    /// The complete trend is cached after a report load, so changing a chart
+    /// filter only selects its daily points instead of reparsing all reports.
+    var visibleDailyQuotaPoints: [DailyQuotaPoint] {
+        guard let dailyQuotaTrend else { return [] }
+        let calendar = Calendar.current
+        let lower = calendar.startOfDay(for: min(filter.startDate, filter.endDate))
+        let upper = calendar.startOfDay(for: max(filter.startDate, filter.endDate))
+        return dailyQuotaTrend.points.filter { $0.day >= lower && $0.day <= upper }
+    }
+
+    var visibleDailyQuotaHomeName: String? {
+        (homes + automaticCodexHomes(excluding: homes)).filter(\.isActive).count > 1
+            ? dailyQuotaHomeName
+            : nil
+    }
 
     var latestUsageObservedAt: Date? {
         reports.compactMap { report in
@@ -368,8 +394,12 @@ final class DashboardViewModel: ObservableObject {
 
             guard generation == loadGeneration else { return }
             let loadedReports = winners.values.map(\.report).sorted { $0.generatedAt > $1.generatedAt }
-            let weeklyReportGroups = grouped.values.map { candidates in
-                candidates.map(\.report).sorted { $0.generatedAt > $1.generatedAt }
+            let weeklyReportGroups = grouped.values.compactMap { candidates -> HomeUsageReportGroup? in
+                guard let home = candidates.first?.home else { return nil }
+                return HomeUsageReportGroup(
+                    home: home,
+                    reports: candidates.map(\.report).sorted { $0.generatedAt > $1.generatedAt }
+                )
             }
             reports = loadedReports
             sessions = rows
@@ -394,27 +424,30 @@ final class DashboardViewModel: ObservableObject {
     /// so one account's quota percentage is never paired with another Home's
     /// Token/API-USD usage. Chart filters never affect these estimates.
     private func updateWeeklyLimitOverview(
-        reportGroups: [[UsageReport]],
+        reportGroups: [HomeUsageReportGroup],
         generation: Int
     ) {
         weeklyLimitOverviewTask?.cancel()
         let estimator = weeklyLimitEstimator
+        let quotaAggregator = dailyQuotaAggregator
         weeklyLimitOverviewTask = Task.detached(priority: .utility) { [weak self] in
             let now = Date()
-            var overviews: [WeeklyLimitOverview] = []
-            for reports in reportGroups {
+            var overviews: [(group: HomeUsageReportGroup, overview: WeeklyLimitOverview)] = []
+            for group in reportGroups {
                 guard !Task.isCancelled else { return }
                 let candidate = estimator.overview(
-                    reports: reports,
+                    reports: group.reports,
                     now: now,
                     historyLimit: WeeklyLimitEstimator.maximumHistoryPeriods
                 )
                 if candidate.current != nil || !candidate.history.isEmpty {
-                    overviews.append(candidate)
+                    overviews.append((group, candidate))
                 }
             }
             guard !Task.isCancelled else { return }
-            let overview = overviews.max { lhs, rhs in
+            let selected = overviews.max { lhs, rhs in
+                let lhs = lhs.overview
+                let rhs = rhs.overview
                 let lhsHasCurrent = lhs.current != nil
                 let rhsHasCurrent = rhs.current != nil
                 if lhsHasCurrent != rhsHasCurrent {
@@ -427,10 +460,56 @@ final class DashboardViewModel: ObservableObject {
                     ?? rhs.history.first?.observationCutoff
                     ?? .distantPast
                 return lhsDate < rhsDate
-            } ?? WeeklyLimitOverview(current: nil, history: [], computedAt: now)
+            }
+            let overview = selected?.overview
+                ?? WeeklyLimitOverview(current: nil, history: [], computedAt: now)
+            let quotaTrend: DailyQuotaTrend?
+            if let selected {
+                let reports = selected.group.reports
+                var firstReportTime: Date?
+                var lastReportTime: Date?
+                func include(_ date: Date?) {
+                    guard let date else { return }
+                    firstReportTime = min(firstReportTime ?? date, date)
+                    lastReportTime = max(lastReportTime ?? date, date)
+                }
+                for report in reports {
+                    for observation in report.rateLimitSnapshots ?? [] {
+                        include(observation.observedAt)
+                    }
+                    for observation in report.rateLimitObservations ?? [] {
+                        include(observation.observedAt)
+                    }
+                    for sample in report.task.usageSamples ?? [] {
+                        include(sample.minute)
+                    }
+                    for thread in report.threads {
+                        for turn in thread.turns {
+                            include(turn.effectiveStart)
+                        }
+                    }
+                }
+                let firstDate = firstReportTime ?? now
+                let lastDate = max(lastReportTime ?? now, now)
+                // Include the day before the first report as a baseline when
+                // one exists. The aggregator decides whether it is observed.
+                let startDate = Calendar.current.date(byAdding: .day, value: -1, to: firstDate)
+                    ?? firstDate
+                quotaTrend = quotaAggregator.aggregate(
+                    reports: reports,
+                    startDate: startDate,
+                    endDate: lastDate,
+                    limitID: overview.current?.snapshot.limitId
+                        ?? overview.history.first?.snapshot.limitId
+                )
+            } else {
+                quotaTrend = nil
+            }
             await MainActor.run { [weak self] in
                 guard let self, generation == self.loadGeneration else { return }
                 self.weeklyLimitOverview = overview
+                self.dailyQuotaTrend = quotaTrend
+                self.dailyQuotaHomeName = selected?.group.home.name
                 if self.filter.preset == .limitPeriod {
                     self.applyPreset(.limitPeriod)
                 }

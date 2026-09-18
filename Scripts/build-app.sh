@@ -4,6 +4,9 @@ set -euo pipefail
 project_root=${0:A:h:h}
 developer_dir=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
 swift_bin="$developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift"
+if [[ ! -x "$swift_bin" && "$developer_dir" == "/Library/Developer/CommandLineTools" ]]; then
+    swift_bin="/usr/bin/swift"
+fi
 
 if [[ ! -x "$swift_bin" ]]; then
     print -u2 "找不到 Xcode Swift 工具链：$swift_bin"

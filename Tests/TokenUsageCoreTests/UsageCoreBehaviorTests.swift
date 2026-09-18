@@ -790,6 +790,11 @@ func historicalSyncRefreshPolicy() throws {
         currentCatalogID: "current-catalog"
     ))
     #expect(HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(hasRateLimitObservations: false),
+        expectedRootID: "session-root",
+        currentCatalogID: "current-catalog"
+    ))
+    #expect(HistoricalReportGenerator.needsRefresh(
         report: try historicalPolicyReport(isLowerBound: true),
         expectedRootID: "session-root",
         currentCatalogID: "current-catalog"
@@ -1069,6 +1074,7 @@ private func testUsageSegment(at: Date, usage: TokenUsage) -> UsageSegment {
 private func historicalPolicyReport(
     hasUsageSamples: Bool = true,
     hasRateLimitSnapshots: Bool = true,
+    hasRateLimitObservations: Bool = true,
     isLowerBound: Bool = false,
     costSuppressed: Bool = false,
     reportCatalogID: String = "current-catalog",
@@ -1087,6 +1093,11 @@ private func historicalPolicyReport(
         object["rate_limit_snapshots"] = []
     } else {
         object.removeValue(forKey: "rate_limit_snapshots")
+    }
+    if hasRateLimitObservations {
+        object["rate_limit_observations"] = []
+    } else {
+        object.removeValue(forKey: "rate_limit_observations")
     }
     task["usage_is_lower_bound"] = isLowerBound
     task["cost"] = [

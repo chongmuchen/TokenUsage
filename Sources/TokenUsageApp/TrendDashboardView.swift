@@ -5,9 +5,13 @@ import TokenUsageCore
 struct TrendDashboardView: View {
     let result: UsageTrendResult
     let weeklyLimitOverview: WeeklyLimitOverview?
+    let dailyQuotaPoints: [DailyQuotaPoint]
+    let dailyQuotaWarnings: [String]
+    let dailyQuotaHomeName: String?
 
     @State private var visibleTokenMetrics = Set(TrendTokenMetric.allCases)
     @State private var priceMetric: TrendPriceMetric = .apiUSD
+    @State private var quotaMetric: DailyQuotaMetric = .startRemaining
 
     var body: some View {
         ScrollView {
@@ -17,6 +21,19 @@ struct TrendDashboardView: View {
                     history: Array((weeklyLimitOverview?.history ?? []).prefix(8)),
                     computedAt: weeklyLimitOverview?.computedAt
                 )
+
+                DailyQuotaChart(
+                    points: dailyQuotaPoints,
+                    metric: $quotaMetric,
+                    homeName: dailyQuotaHomeName
+                )
+                DailyQuotaUSDChart(
+                    points: dailyQuotaPoints,
+                    homeName: dailyQuotaHomeName
+                )
+                if !dailyQuotaWarnings.isEmpty {
+                    TrendWarningCard(warnings: dailyQuotaWarnings)
+                }
 
                 if result.series.isEmpty {
                     ContentUnavailableView {
@@ -981,7 +998,7 @@ private enum TrendPriceTooltipFormatter {
     }
 }
 
-private struct TrendCard<Accessory: View, Content: View>: View {
+struct TrendCard<Accessory: View, Content: View>: View {
     let title: String
     let subtitle: String
     @ViewBuilder let accessory: Accessory

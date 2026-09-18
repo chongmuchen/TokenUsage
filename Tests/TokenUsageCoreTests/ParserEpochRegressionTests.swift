@@ -18,7 +18,7 @@ func parserRebasesCounterAtNewTaskEpoch() throws {
     #expect(rawUsage["input_tokens"] as? Int == 210)
     #expect(rawUsage["output_tokens"] as? Int == 28)
     #expect(rawUsage["total_tokens"] as? Int == 238)
-    #expect(state["cache_schema_version"] as? Int == 14)
+    #expect(state["cache_schema_version"] as? Int == 15)
     #expect(state["last_total_usage_task_epoch"] as? Int == 2)
 
     let turns = try #require(state["turns"] as? [String: [String: Any]])
@@ -92,6 +92,75 @@ func parserCapturesRateLimitsBeforeZeroDeltaReturn() throws {
     #expect(secondary["used_percent"] as? Int == 28)
     #expect(secondary["window_minutes"] as? Int == 10_080)
     #expect(secondary["resets_at"] as? String == "2026-09-14T12:00:00Z")
+
+    let observations = try #require(state["rate_limit_observations"] as? [[String: Any]])
+    #expect(observations.count == 4)
+    #expect(observations.filter { $0["bucket"] as? String == "secondary" }
+        .compactMap { $0["observed_at"] as? String }
+        == ["2026-09-07T10:00:00Z", "2026-09-07T10:01:00Z"])
+}
+
+@Test("Parser preserves daily and reset boundaries while compacting intermediate quota polls")
+func parserCompactsRateLimitObservations() throws {
+    func limit(_ used: Int, reset: Int) -> [String: Any] {
+        [
+            "limit_id": "codex",
+            "secondary": [
+                "used_percent": used,
+                "window_minutes": 10_080,
+                "resets_at": reset
+            ]
+        ]
+    }
+    let firstReset = 1_789_387_200
+    // A manual early reset on Sep 8 creates a weekly window ending Sep 15.
+    let nextReset = 1_789_437_600
+    let state = try runParserEpochRecords([
+        epochTokenCount(input: 0, output: 0, at: "2026-09-07T13:00:00Z", rateLimits: limit(10, reset: firstReset)),
+        epochTokenCount(input: 0, output: 0, at: "2026-09-07T14:00:00Z", rateLimits: limit(20, reset: firstReset + 28)),
+        epochTokenCount(input: 0, output: 0, at: "2026-09-07T15:00:00Z", rateLimits: limit(30, reset: firstReset + 42)),
+        epochTokenCount(input: 0, output: 0, at: "2026-09-08T01:00:00Z", rateLimits: limit(35, reset: firstReset)),
+        epochTokenCount(input: 0, output: 0, at: "2026-09-08T02:00:00Z", rateLimits: limit(38, reset: firstReset)),
+        epochTokenCount(input: 0, output: 0, at: "2026-09-08T03:00:00Z", rateLimits: limit(2, reset: nextReset)),
+        epochTokenCount(input: 0, output: 0, at: "2026-09-08T04:00:00Z", rateLimits: limit(4, reset: nextReset)),
+        epochTokenCount(input: 0, output: 0, at: "2026-09-08T05:00:00Z", rateLimits: limit(5, reset: nextReset))
+    ])
+
+    let observations = try #require(state["rate_limit_observations"] as? [[String: Any]])
+    #expect(observations.count == 6)
+    #expect(observations.compactMap { $0["used_percent"] as? Int } == [10, 30, 35, 38, 2, 5])
+    #expect(observations.compactMap { $0["observed_at"] as? String } == [
+        "2026-09-07T13:00:00Z", "2026-09-07T15:00:00Z",
+        "2026-09-08T01:00:00Z", "2026-09-08T02:00:00Z",
+        "2026-09-08T03:00:00Z", "2026-09-08T05:00:00Z"
+    ])
+    let snapshots = try #require(state["rate_limit_snapshots"] as? [[String: Any]])
+    #expect(snapshots.count == 4) // Exact reset timestamps retain their previous meaning.
+}
+
+@Test("Merged root and agent observations keep both sides of a reset")
+func parserMergesRateLimitObservationsAcrossThreads() throws {
+    func observation(_ at: String, used: Int, reset: String) -> [String: Any] {
+        [
+            "observed_at": at,
+            "limit_id": "codex",
+            "bucket": "secondary",
+            "used_percent": used,
+            "window_minutes": 10_080,
+            "resets_at": reset
+        ]
+    }
+    let oldReset = "2026-09-14T12:00:00Z"
+    let newReset = "2026-09-15T02:00:00Z"
+    let merged = try mergeRateLimitObservations([
+        observation("2026-09-08T11:00:00Z", used: 12, reset: oldReset),
+        observation("2026-09-08T10:30:00Z", used: 11, reset: oldReset),
+        observation("2026-09-08T10:00:00Z", used: 10, reset: oldReset),
+        observation("2026-09-08T11:30:00Z", used: 2, reset: newReset),
+        observation("2026-09-08T12:00:00Z", used: 4, reset: newReset),
+        observation("2026-09-08T11:00:00Z", used: 12, reset: oldReset)
+    ])
+    #expect(merged.compactMap { $0["used_percent"] as? Int } == [10, 12, 2, 4])
 }
 
 @Test("Rate-limit merge keeps the latest observation for each exact reset and preserves jitter")
@@ -179,20 +248,31 @@ private func runParserEpochRecords(_ records: [[String: Any]]) throws -> [String
 }
 
 private func mergeRateLimitSnapshots(_ snapshots: [[String: Any]]) throws -> [[String: Any]] {
+    try mergeRateLimitValues(snapshots, function: "_merge_rate_limit_snapshots")
+}
+
+private func mergeRateLimitObservations(_ observations: [[String: Any]]) throws -> [[String: Any]] {
+    try mergeRateLimitValues(observations, function: "_merge_rate_limit_observations")
+}
+
+private func mergeRateLimitValues(
+    _ values: [[String: Any]],
+    function: String
+) throws -> [[String: Any]] {
     let script = try #require(
         TokenUsageResources.url(forResource: "token_usage", withExtension: "py")
     )
-    let snapshotsData = try JSONSerialization.data(withJSONObject: snapshots)
+    let snapshotsData = try JSONSerialization.data(withJSONObject: values)
     let snapshotsJSON = String(decoding: snapshotsData, as: UTF8.self)
     let code = """
         import json, runpy, sys
         ns = runpy.run_path(sys.argv[1])
-        print(json.dumps(ns["_merge_rate_limit_snapshots"](json.loads(sys.argv[2]))))
+        print(json.dumps(ns[sys.argv[3]](json.loads(sys.argv[2]))))
         """
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-    process.arguments = ["-c", code, script.path, snapshotsJSON]
+    process.arguments = ["-c", code, script.path, snapshotsJSON, function]
     var environment = ProcessInfo.processInfo.environment
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     process.environment = environment

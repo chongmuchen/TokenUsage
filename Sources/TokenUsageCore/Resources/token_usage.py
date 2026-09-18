@@ -32,7 +32,8 @@ from urllib.parse import quote
 from uuid import UUID
 
 
-CACHE_SCHEMA_VERSION = 14
+CACHE_SCHEMA_VERSION = 15
+RATE_LIMIT_RESET_JITTER_SECONDS = 300
 CHECKPOINT_BYTES = 4096
 REPORT_SCHEMA_VERSION = 1
 PROMPT_PREVIEW_CHARACTERS = 240
@@ -279,6 +280,74 @@ def _add_rate_limit_snapshot(
     container.append(candidate)
 
 
+def _rate_limit_observation_day(value: Dict[str, Any]) -> Tuple[str, str]:
+    observed_at = value.get("observed_at")
+    if not isinstance(observed_at, str):
+        return "", ""
+    try:
+        timestamp = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    except ValueError:
+        return observed_at[:10], observed_at[:10]
+    return timestamp.date().isoformat(), timestamp.astimezone().date().isoformat()
+
+
+def _same_rate_limit_observation_day_period(
+    lhs: Dict[str, Any], rhs: Dict[str, Any]
+) -> bool:
+    if _rate_limit_snapshot_key(lhs) != _rate_limit_snapshot_key(rhs):
+        return False
+    if _rate_limit_observation_day(lhs) != _rate_limit_observation_day(rhs):
+        return False
+    lhs_reset = _iso_to_epoch(lhs.get("resets_at"))
+    rhs_reset = _iso_to_epoch(rhs.get("resets_at"))
+    return (
+        lhs_reset is not None
+        and rhs_reset is not None
+        and abs(lhs_reset - rhs_reset) <= RATE_LIMIT_RESET_JITTER_SECONDS
+    )
+
+
+def _add_rate_limit_observation(
+    container: List[Dict[str, Any]],
+    candidate: Dict[str, Any],
+    indices: Dict[str, List[int]],
+) -> None:
+    """Keep the first and last poll per calendar day and reset period.
+
+    A report may span many Stop events. Retaining the first and last observation
+    for both UTC and the machine's local day preserves daily boundaries without
+    serializing every token_count event. A five-minute reset-time tolerance
+    absorbs server timestamp jitter. Per-stream indices avoid scanning an ever
+    growing timeline in the Stop Hook. The local day uses the machine timezone
+    when the report is generated, matching the app's current calendar.
+    """
+    stream_key = json.dumps(_rate_limit_snapshot_key(candidate), separators=(",", ":"))
+    matching = indices.get(stream_key, [])
+    if not matching:
+        indices[stream_key] = [len(container)]
+        container.append(candidate)
+        return
+
+    latest_index = matching[-1]
+    latest = container[latest_index]
+    if latest == candidate:
+        return
+    latest_epoch = _iso_to_epoch(latest.get("observed_at"))
+    candidate_epoch = _iso_to_epoch(candidate.get("observed_at"))
+    if latest_epoch is not None and candidate_epoch is not None and candidate_epoch < latest_epoch:
+        indices[stream_key] = [latest_index, len(container)]
+        container.append(candidate)
+        return
+
+    if _same_rate_limit_observation_day_period(latest, candidate) and len(matching) == 2:
+        previous = container[matching[0]]
+        if _same_rate_limit_observation_day_period(previous, candidate):
+            container[latest_index] = candidate
+            return
+    indices[stream_key] = [latest_index, len(container)]
+    container.append(candidate)
+
+
 def _capture_rate_limit_snapshots(
     state: Dict[str, Any], payload: Dict[str, Any], timestamp: Any
 ) -> None:
@@ -291,6 +360,8 @@ def _capture_rate_limit_snapshots(
     shared_limit_name = rate_limits.get("limit_name")
     shared_plan_type = rate_limits.get("plan_type")
     container = state.setdefault("rate_limit_snapshots", [])
+    observations = state.setdefault("rate_limit_observations", [])
+    observation_indices = state.setdefault("rate_limit_observation_indices", {})
 
     for bucket in ("primary", "secondary"):
         bucket_value = rate_limits.get(bucket)
@@ -333,6 +404,7 @@ def _capture_rate_limit_snapshots(
         if isinstance(plan_type, str) and plan_type:
             candidate["plan_type"] = plan_type
         _add_rate_limit_snapshot(container, candidate)
+        _add_rate_limit_observation(observations, candidate, observation_indices)
 
 
 def _merge_rate_limit_snapshots(
@@ -356,6 +428,24 @@ def _merge_rate_limit_snapshots(
             str(value.get("bucket") or ""),
         )
     )
+    return result
+
+
+def _merge_rate_limit_observations(
+    values: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    candidates = [dict(value) for value in values if isinstance(value, dict)]
+    candidates.sort(
+        key=lambda value: (
+            str(value.get("observed_at") or ""),
+            str(value.get("limit_id") or ""),
+            str(value.get("bucket") or ""),
+        )
+    )
+    result: List[Dict[str, Any]] = []
+    indices: Dict[str, List[int]] = {}
+    for candidate in candidates:
+        _add_rate_limit_observation(result, candidate, indices)
     return result
 
 
@@ -601,6 +691,8 @@ def _new_parser_state(transcript_path: Path, stat_result: os.stat_result) -> Dic
         "unattributed_segments": [],
         "usage_samples": [],
         "rate_limit_snapshots": [],
+        "rate_limit_observations": [],
+        "rate_limit_observation_indices": {},
         "unattributed_counts": _zero_counts(),
         "last_event_at": None,
         "parse_errors": 0,
@@ -1540,6 +1632,7 @@ def _thread_summary(
         "_usage_samples": owned_samples,
         "_image_generations": owned_image_generations,
         "_rate_limit_snapshots": list(state.get("rate_limit_snapshots") or []),
+        "_rate_limit_observations": list(state.get("rate_limit_observations") or []),
         "warnings": list(dict.fromkeys(warnings)),
         "parse_errors": _as_int(state.get("parse_errors")),
         "unclassified_compaction_total": _as_int(state.get("unclassified_compaction_total")),
@@ -2061,6 +2154,11 @@ def build_report(
         for summary in summaries.values()
         for snapshot in (summary.get("_rate_limit_snapshots") or [])
     )
+    task_rate_limit_observations = _merge_rate_limit_observations(
+        observation
+        for summary in summaries.values()
+        for observation in (summary.get("_rate_limit_observations") or [])
+    )
     # Do not serialize minute samples beneath thread/turn breakdowns. Those
     # structures intentionally repeat accounting views and would invite double
     # counting by consumers.
@@ -2068,6 +2166,7 @@ def build_report(
         summary.pop("_usage_samples", None)
         summary.pop("_image_generations", None)
         summary.pop("_rate_limit_snapshots", None)
+        summary.pop("_rate_limit_observations", None)
 
     catalog = _load_catalog()
     report_warnings = list(graph_warnings)
@@ -2132,6 +2231,7 @@ def build_report(
         "selected_turn_id": turn_id,
         "image_generations": task_image_generations,
         "rate_limit_snapshots": task_rate_limit_snapshots,
+        "rate_limit_observations": task_rate_limit_observations,
         "current_turn": {
             "available": selected_turn is not None,
             "usage_is_provisional": current_provisional,

@@ -493,6 +493,11 @@ public struct UsageReport: Codable, Equatable, Identifiable, Sendable {
     /// Additive report-v1 rate-limit observations. `nil` means the producer
     /// predates rate-limit capture rather than that the account has no limit.
     public let rateLimitSnapshots: [RateLimitSnapshot]?
+    /// Chronological rate-limit observations used for daily quota trends.
+    /// Intermediate polls may be compressed to each day's period endpoints.
+    /// `nil` means the report predates this timeline; an empty array means
+    /// there were no valid rate-limit observations in the transcript.
+    public let rateLimitObservations: [RateLimitSnapshot]?
     public let currentTurn: CurrentTurnSummary
     public let task: TaskSummary
     public let threads: [ThreadSummary]
@@ -508,17 +513,15 @@ public enum UsageReportDecoder {
     public static func makeJSONDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        let ordinary = Date.ISO8601FormatStyle()
         decoder.dateDecodingStrategy = .custom { decoder in
             let container = try decoder.singleValueContainer()
             let text = try container.decode(String.self)
 
-            let fractional = ISO8601DateFormatter()
-            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let date = fractional.date(from: text) { return date }
+            if let date = try? fractional.parse(text) { return date }
 
-            let ordinary = ISO8601DateFormatter()
-            ordinary.formatOptions = [.withInternetDateTime]
-            if let date = ordinary.date(from: text) { return date }
+            if let date = try? ordinary.parse(text) { return date }
 
             throw DecodingError.dataCorruptedError(
                 in: container,

@@ -215,7 +215,7 @@ public actor HistoricalReportGenerator {
     }
 
     /// A report is rebuilt when a newer parser can add minute samples or
-    /// rate-limit snapshots, turn an observed lower bound or a suppressed
+    /// rate-limit observations, turn an observed lower bound or a suppressed
     /// estimate into a complete result, or when bundled public prices changed.
     /// Kept internal so the policy can be regression tested without touching a
     /// user's Codex Home.
@@ -227,6 +227,7 @@ public actor HistoricalReportGenerator {
         guard report.rootThreadId == expectedRootID else { return true }
         guard report.task.usageSamples != nil else { return true }
         guard report.rateLimitSnapshots != nil else { return true }
+        guard report.rateLimitObservations != nil else { return true }
         guard !report.task.usageIsLowerBound else { return true }
         guard report.task.cost.costSuppressed != true else { return true }
 

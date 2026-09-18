@@ -28,7 +28,10 @@ struct DashboardView: View {
                 case .trend:
                     TrendDashboardView(
                         result: viewModel.trendResult,
-                        weeklyLimitOverview: viewModel.weeklyLimitOverview
+                        weeklyLimitOverview: viewModel.weeklyLimitOverview,
+                        dailyQuotaPoints: viewModel.visibleDailyQuotaPoints,
+                        dailyQuotaWarnings: viewModel.dailyQuotaTrend?.warnings ?? [],
+                        dailyQuotaHomeName: viewModel.visibleDailyQuotaHomeName
                     )
                 case .sessions:
                     if viewModel.filteredSessions.isEmpty {
@@ -79,7 +82,7 @@ struct DashboardView: View {
                 Label("同步当前日期范围", systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90")
             }
             .disabled(viewModel.isSyncingHistory)
-            .help("为当前起止日期内缺失、下界、抑价、缺少限额快照或旧价目的会话新建或重建本地报告；不调用模型")
+            .help("为当前起止日期内缺失、下界、抑价、缺少限额快照或每日观测、旧价目的会话新建或重建本地报告；不调用模型")
 
             Button {
                 viewModel.reload()

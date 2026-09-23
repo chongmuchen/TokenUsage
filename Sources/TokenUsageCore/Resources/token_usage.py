@@ -690,6 +690,7 @@ def _checkpoint_hash(transcript_path: Path, offset: int) -> str:
 def _new_parser_state(transcript_path: Path, stat_result: os.stat_result) -> Dict[str, Any]:
     return {
         "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "pricing_catalog_id": _load_catalog().get("catalog_id"),
         "transcript_path": str(transcript_path),
         "file_dev": stat_result.st_dev,
         "file_ino": stat_result.st_ino,
@@ -739,6 +740,11 @@ def _load_parser_state(transcript_path: Path, stat_result: os.stat_result) -> Op
     if not isinstance(value, dict):
         return None
     if value.get("cache_schema_version") != CACHE_SCHEMA_VERSION:
+        return None
+    # Long-context flags are derived per request from the catalog before
+    # samples are merged. Replay old caches when model pricing changes so
+    # previously unknown models acquire the correct context-length tier.
+    if value.get("pricing_catalog_id") != _load_catalog().get("catalog_id"):
         return None
     if value.get("transcript_path") != str(transcript_path):
         return None

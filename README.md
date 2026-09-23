@@ -121,6 +121,7 @@ Codex 官方说明 Hook transcript 的格式不是稳定公共接口，因此将
 
 价格来自随 App 打包的带日期静态价目快照：
 
+- 当前快照为 **2026-09-23**，新增 GPT-6 Sol 与 GPT-6 Luna 的 Standard/Fast API USD 和 Codex Credits 费率。API 估算包含缓存读、缓存写及单次输入超过 272K Token 的长上下文费率；两款模型 API Fast 为 Standard 的 2 倍，Codex Fast Credits 为 2.5 倍。费率来源为 [Sol](https://developers.openai.com/api/docs/models/gpt-6-sol)、[Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) 与 [Codex Credits](https://learn.chatgpt.com/docs/pricing)。旧报告可通过“同步当前日期范围”按新快照重建；解析器会同时重建旧价目下的缓存，重新识别新模型每次请求的长上下文档位。
 - `Credits` 是 Codex credits 公开费率估算；配置档位无法确认时会明确退回 Standard 等价或部分价。
 - `API USD 等价` 是相同 token 按默认公共 API token 价的等价估算，不是 ChatGPT/Codex 订阅的实际美元扣款，也不包含区域加价、工具调用、图片生成等额外费用。
 - 周限额外推同样不是账单，也不是服务端公布的固定 Token 上限：它假设本周期后续的模型、缓存、上下文和速度构成与目前相近。历史的“最终使用”取周期内最后一次本地观测。低使用百分比、定价覆盖不足、旧报告、其他设备用量，或同一 Codex Home 在历史中切换登录账号，都会降低准确度；界面会显示快照截止时间和近似状态。

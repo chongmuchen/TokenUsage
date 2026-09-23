@@ -12,10 +12,10 @@ private struct ExpectedRates {
 func pricingCatalogCurrentSnapshotMetadata() throws {
     let catalog = try PricingCatalog.bundled()
 
-    #expect(catalog.catalogId == "openai-public-2026-09-05")
-    #expect(catalog.observedAt == "2026-09-05")
+    #expect(catalog.catalogId == "openai-public-2026-09-23")
+    #expect(catalog.observedAt == "2026-09-23")
     #expect(catalog.tokenUnit == 1_000_000)
-    #expect(catalog.models.count == 7)
+    #expect(catalog.models.count == 9)
     #expect(catalog.entry(for: "gpt-5.6")?.key == "gpt-5.6-sol")
 }
 
@@ -26,6 +26,16 @@ func pricingCatalogCurrentCreditRates() throws {
     try expectCredits(
         catalog, model: "gpt-6-astra",
         input: "250", cachedInput: "25", output: "1250",
+        fastSupport: "documented", fastMultiplier: "2.5", speedMultiplier: nil
+    )
+    try expectCredits(
+        catalog, model: "gpt-6-sol",
+        input: "50", cachedInput: "5", output: "250",
+        fastSupport: "documented", fastMultiplier: "2.5", speedMultiplier: nil
+    )
+    try expectCredits(
+        catalog, model: "gpt-6-luna",
+        input: "2.5", cachedInput: "0.25", output: "12.5",
         fastSupport: "documented", fastMultiplier: "2.5", speedMultiplier: nil
     )
     try expectCredits(
@@ -70,6 +80,20 @@ func pricingCatalogCurrentTieredAPIRates() throws {
         standardLong: .init(input: "20.00", cachedInput: "2.00", cacheWrite: "25.00", output: "75.00"),
         fastShort: .init(input: "20.00", cachedInput: "2.00", cacheWrite: "25.00", output: "100.00"),
         fastLong: .init(input: "40.00", cachedInput: "4.00", cacheWrite: "50.00", output: "150.00")
+    )
+    try expectTieredAPI(
+        catalog, model: "gpt-6-sol",
+        standardShort: .init(input: "2.00", cachedInput: "0.20", cacheWrite: "2.50", output: "10.00"),
+        standardLong: .init(input: "4.00", cachedInput: "0.40", cacheWrite: "5.00", output: "15.00"),
+        fastShort: .init(input: "4.00", cachedInput: "0.40", cacheWrite: "5.00", output: "20.00"),
+        fastLong: .init(input: "8.00", cachedInput: "0.80", cacheWrite: "10.00", output: "30.00")
+    )
+    try expectTieredAPI(
+        catalog, model: "gpt-6-luna",
+        standardShort: .init(input: "0.10", cachedInput: "0.01", cacheWrite: "0.125", output: "0.50"),
+        standardLong: .init(input: "0.20", cachedInput: "0.02", cacheWrite: "0.25", output: "0.75"),
+        fastShort: .init(input: "0.20", cachedInput: "0.02", cacheWrite: "0.25", output: "1.00"),
+        fastLong: .init(input: "0.40", cachedInput: "0.04", cacheWrite: "0.50", output: "1.50")
     )
     try expectTieredAPI(
         catalog, model: "gpt-5.6-sol",

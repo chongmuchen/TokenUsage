@@ -831,6 +831,22 @@ func historicalSyncRefreshPolicy() throws {
     ))
 }
 
+@Test("Historical sync replaces the September 5 price snapshot with the current catalog")
+func historicalSyncRefreshesPreviousPublicPricingSnapshot() throws {
+    let catalog = try PricingCatalog.bundled()
+    let previous = "openai-public-2026-09-05"
+    #expect(HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(reportCatalogID: previous, costCatalogID: previous),
+        expectedRootID: "session-root",
+        currentCatalogID: catalog.catalogId
+    ))
+    #expect(!HistoricalReportGenerator.needsRefresh(
+        report: try historicalPolicyReport(reportCatalogID: catalog.catalogId, costCatalogID: catalog.catalogId),
+        expectedRootID: "session-root",
+        currentCatalogID: catalog.catalogId
+    ))
+}
+
 @Test("Filtered summary counts only sessions and preserves displayed price coverage")
 func filteredSummaryRow() throws {
     let builder = UsageTreeBuilder(catalog: try PricingCatalog.bundled())

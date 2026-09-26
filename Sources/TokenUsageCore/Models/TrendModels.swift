@@ -239,17 +239,20 @@ public struct UsageTrendAggregate: Equatable, Sendable {
     public let credits: UsageTrendPriceSummary
     public let apiUSD: UsageTrendPriceSummary
     public let isApproximate: Bool
+    public let isLowerBound: Bool
 
     public init(
         tokens: UsageTrendTokenBreakdown,
         credits: UsageTrendPriceSummary,
         apiUSD: UsageTrendPriceSummary,
-        isApproximate: Bool
+        isApproximate: Bool,
+        isLowerBound: Bool = false
     ) {
         self.tokens = tokens
         self.credits = credits
         self.apiUSD = apiUSD
         self.isApproximate = isApproximate
+        self.isLowerBound = isLowerBound
     }
 }
 

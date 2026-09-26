@@ -111,13 +111,14 @@ public struct UsageTrendAggregator: Sendable {
 
     private func atoms(for report: UsageReport, warnings: inout [String]) -> [TrendAtom] {
         let suppressed = report.task.cost.costSuppressed == true
+        let isLowerBound = report.task.usageIsLowerBound
+        if isLowerBound {
+            warnings.append("会话 \(shortID(report.rootThreadId)) 的统计是已观测下界。")
+        }
         if let samples = report.task.usageSamples {
             let sampleUsage = TokenUsage.sum(samples.map(\.usage))
             if sampleUsage != report.task.usage {
                 warnings.append("会话 \(shortID(report.rootThreadId)) 的分钟样本与任务总量无法对账。")
-            }
-            if report.task.usageIsLowerBound {
-                warnings.append("会话 \(shortID(report.rootThreadId)) 的统计是已观测下界。")
             }
             return samples.map { sample in
                 let approximate = sample.minute == nil
@@ -144,7 +145,8 @@ public struct UsageTrendAggregator: Sendable {
                         requestCount: sample.requestCount
                     ),
                     costSuppressed: suppressed,
-                    approximate: approximate
+                    approximate: approximate,
+                    isLowerBound: isLowerBound
                 )
             }
         }
@@ -160,7 +162,8 @@ public struct UsageTrendAggregator: Sendable {
                 ),
                 segment: segment,
                 costSuppressed: suppressed,
-                approximate: true
+                approximate: true,
+                isLowerBound: isLowerBound
             )
         }
     }
@@ -269,6 +272,7 @@ private struct TrendAtom: Sendable {
     let segment: UsageSegment
     let costSuppressed: Bool
     let approximate: Bool
+    let isLowerBound: Bool
 }
 
 private struct TrendAccumulator: Sendable {
@@ -276,11 +280,13 @@ private struct TrendAccumulator: Sendable {
     private var credits = TrendPriceAccumulator()
     private var apiUSD = TrendPriceAccumulator()
     private var approximate = false
+    private var isLowerBound = false
 
     mutating func add(_ atom: TrendAtom, estimator: CreditEstimator) {
         let totalTokens = atom.segment.usage.totalTokens
         tokens = tokens + UsageTrendTokenBreakdown(usage: atom.segment.usage)
         approximate = approximate || atom.approximate
+        isLowerBound = isLowerBound || atom.isLowerBound
 
         if atom.costSuppressed {
             credits.addSuppressed(tokens: totalTokens)
@@ -296,7 +302,8 @@ private struct TrendAccumulator: Sendable {
             tokens: tokens,
             credits: credits.finalized(),
             apiUSD: apiUSD.finalized(),
-            isApproximate: approximate
+            isApproximate: approximate,
+            isLowerBound: isLowerBound
         )
     }
 }

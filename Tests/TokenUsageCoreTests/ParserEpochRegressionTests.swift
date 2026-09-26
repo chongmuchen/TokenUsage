@@ -145,6 +145,103 @@ func parserKeepsForkPrefixWarningOutOfOwnedTurn() throws {
     #expect(!warnings.contains { $0.contains("first token increment was unavailable") })
 }
 
+@Test("Fork report prices safe requests and agents after an unclassified first increment")
+func parserReportPricesSafeUsageAfterMissingForkIncrement() throws {
+    let turnID = "01a0a5b2-161d-7af3-b678-58af4c2c24d8"
+    let report = try runParserEpochReport([
+        epochSessionMeta(forkedFrom: "01a08aae-0d7d-74d2-b827-7a3b3a43ec4b"),
+        epochPricingSettings(),
+        epochTaskStarted(turnID, at: "2026-09-15T15:31:46Z"),
+        // A compaction sample exposes a total but no billable categories.
+        // Its inherited cumulative counter must never become owned usage.
+        epochTokenCount(
+            input: 95_000_000, output: 100_000, at: "2026-09-15T15:31:58Z",
+            cachedInput: 90_000_000,
+            lastUsage: [
+                "input_tokens": 0, "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0, "output_tokens": 0,
+                "reasoning_output_tokens": 0, "total_tokens": 2_000
+            ]
+        ),
+        epochTokenCount(
+            input: 95_001_000, output: 100_020, at: "2026-09-15T15:32:04Z",
+            cachedInput: 90_000_500
+        ),
+        epochTaskComplete(turnID, at: "2026-09-15T15:32:10Z")
+    ], agents: [[
+        ["type": "session_meta", "payload": ["id": "synthetic-agent"]],
+        epochPricingSettings(),
+        epochTaskStarted("agent-turn", at: "2026-09-15T15:31:50Z"),
+        epochTokenCount(input: 200, output: 10, at: "2026-09-15T15:32:05Z"),
+        epochTaskComplete("agent-turn", at: "2026-09-15T15:32:09Z")
+    ]])
+
+    let task = try #require(report["task"] as? [String: Any])
+    let rootUsage = try #require(task["root_usage"] as? [String: Any])
+    let agentsUsage = try #require(task["agents_usage"] as? [String: Any])
+    #expect(rootUsage["total_tokens"] as? Int == 1_020)
+    #expect(agentsUsage["total_tokens"] as? Int == 210)
+    #expect(task["linked_agent_threads"] as? Int == 1)
+    #expect(task["usage_is_lower_bound"] as? Bool == true)
+    let completeness = try #require(report["completeness"] as? [String: Any])
+    #expect(completeness["usage_summary"] as? String == "lower_bound")
+
+    // All transcripts are complete and present, so the missing first
+    // increment is the only reason this report remains a lower bound.
+    let threads = try #require(report["threads"] as? [[String: Any]])
+    #expect(threads.allSatisfy { $0["active_turn_count"] as? Int == 0 })
+    #expect(threads.allSatisfy { $0["exclusive_usage_available"] as? Bool == true })
+    let warnings = try #require(report["warnings"] as? [String])
+    #expect(warnings.contains { $0.contains("first token increment was unavailable") })
+    #expect(!warnings.contains { $0.contains("state database") || $0.contains("could not be read") })
+
+    let current = try #require(report["current_turn"] as? [String: Any])
+    for section in [task, current] {
+        let usage = try #require(section["usage"] as? [String: Any])
+        #expect(usage["input_tokens"] as? Int == 1_200)
+        #expect(usage["cached_input_tokens"] as? Int == 500)
+        #expect(usage["output_tokens"] as? Int == 30)
+        #expect(usage["total_tokens"] as? Int == 1_230)
+        let cost = try #require(section["cost"] as? [String: Any])
+        #expect(cost["cost_suppressed"] as? Bool == false)
+        #expect(cost["api_configured_priced_tokens"] as? Int == 1_230)
+        #expect(cost["credit_configured_priced_tokens"] as? Int == 1_230)
+        #expect(cost["api_usd_configured_tier_estimate"] as? String == "0.001800")
+        #expect(cost["codex_credits_configured_tier_estimate"] as? String == "0.045000")
+    }
+}
+
+@Test("Report still suppresses prices for a genuine within-task counter decrease")
+func parserReportSuppressesCounterInvariantFailure() throws {
+    let report = try runParserEpochReport([
+        ["type": "session_meta", "payload": ["id": "synthetic-root"]],
+        epochPricingSettings(),
+        epochTaskStarted("turn-1", at: "2026-09-15T15:31:46Z"),
+        epochTokenCount(input: 100, output: 10, at: "2026-09-15T15:31:58Z"),
+        epochTokenCount(input: 80, output: 8, at: "2026-09-15T15:32:01Z"),
+        epochTokenCount(input: 120, output: 12, at: "2026-09-15T15:32:04Z"),
+        epochTaskComplete("turn-1", at: "2026-09-15T15:32:10Z")
+    ])
+
+    let task = try #require(report["task"] as? [String: Any])
+    #expect(task["usage_is_lower_bound"] as? Bool == true)
+    let usage = try #require(task["usage"] as? [String: Any])
+    #expect(usage["total_tokens"] as? Int == 132)
+    let warnings = try #require(report["warnings"] as? [String])
+    #expect(warnings.contains { $0.contains("token counters decreased") })
+    let current = try #require(report["current_turn"] as? [String: Any])
+    for section in [task, current] {
+        let cost = try #require(section["cost"] as? [String: Any])
+        #expect(cost["cost_suppressed"] as? Bool == true)
+        #expect(cost["api_configured_priced_tokens"] as? Int == 0)
+        #expect(cost["credit_configured_priced_tokens"] as? Int == 0)
+        #expect(cost["api_usd_configured_tier_estimate"] is NSNull)
+        #expect(cost["codex_credits_configured_tier_estimate"] is NSNull)
+        #expect(cost["api_usd_configured_tier_priced_subtotal"] is NSNull)
+        #expect(cost["codex_credits_configured_tier_priced_subtotal"] is NSNull)
+    }
+}
+
 @Test("Parser captures both rate-limit buckets even when token usage does not change")
 func parserCapturesRateLimitsBeforeZeroDeltaReturn() throws {
     let limits = epochRateLimits(primaryUsed: 7.5, secondaryUsed: 28)
@@ -277,6 +374,74 @@ func parserMergesRateLimitSnapshotsAcrossThreads() throws {
     #expect(snapshots[1]["resets_at"] as? String == "2026-09-14T12:00:28Z")
     #expect(snapshots[2]["observed_at"] as? String == "2026-09-14T10:00:00Z")
     #expect(snapshots[2]["used_percent"] as? Int == 3)
+}
+
+private func runParserEpochReport(
+    _ records: [[String: Any]], agents: [[[String: Any]]] = []
+) throws -> [String: Any] {
+    let script = try #require(TokenUsageResources.url(forResource: "token_usage", withExtension: "py"))
+    let recordsData = try JSONSerialization.data(withJSONObject: [records] + agents)
+    let code = """
+        import json, os, runpy, sqlite3, sys, tempfile
+        from pathlib import Path
+
+        ns = runpy.run_path(sys.argv[1])
+        record_sets = json.loads(sys.argv[2])
+        root_id = record_sets[0][0]["payload"]["id"]
+        with tempfile.TemporaryDirectory(prefix="token-usage-epoch-report-test-") as directory:
+            root = Path(directory).resolve()
+            os.environ["CODEX_TOKEN_USAGE_CODEX_DIR"] = str(root)
+            os.environ["CODEX_TOKEN_USAGE_STATE_DIR"] = str(root / "token-usage")
+            sessions = root / "sessions"
+            sessions.mkdir()
+            connection = sqlite3.connect(root / "state_5.sqlite")
+            connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, "
+                               "model TEXT, reasoning_effort TEXT, thread_source TEXT, "
+                               "agent_path TEXT, source TEXT, updated_at_ms INTEGER)")
+            connection.execute("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)")
+            for index, records in enumerate(record_sets):
+                thread_id = records[0]["payload"]["id"]
+                transcript = sessions / ("rollout-" + thread_id + ".jsonl")
+                transcript.write_text("".join(json.dumps(record) + "\\n" for record in records))
+                connection.execute("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (
+                    thread_id, str(transcript), "gpt-6-sol", "medium",
+                    "user" if index == 0 else "subagent", None, "", 0,
+                ))
+                if index:
+                    connection.execute("INSERT INTO thread_spawn_edges VALUES (?, ?)", (root_id, thread_id))
+            connection.commit()
+            connection.close()
+            report = ns["build_report"](root_id, use_cache=False)
+        print(json.dumps(report))
+        """
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+    process.arguments = ["-c", code, script.path, String(decoding: recordsData, as: UTF8.self)]
+    var environment = ProcessInfo.processInfo.environment
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    process.environment = environment
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.standardOutput = stdout
+    process.standardError = stderr
+    try process.run()
+    let output = stdout.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+    #expect(process.terminationStatus == 0, Comment(rawValue: String(decoding: errorOutput, as: UTF8.self)))
+    return try #require(try JSONSerialization.jsonObject(with: output) as? [String: Any])
+}
+
+private func epochPricingSettings() -> [String: Any] {
+    [
+        "timestamp": "2026-09-15T15:30:46Z",
+        "type": "event_msg",
+        "payload": [
+            "type": "thread_settings_applied",
+            "thread_settings": ["model": "gpt-6-sol", "service_tier": "standard"]
+        ]
+    ]
 }
 
 private func runParserEpochRecords(

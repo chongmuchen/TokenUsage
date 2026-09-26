@@ -34,6 +34,7 @@ func trendMinuteBoundaryAndSingleAccountingPlane() throws {
     #expect(series.summary.tokens.outputTokens == 10)
     #expect(series.summary.tokens.reasoningOutputTokens == 2)
     #expect(series.summary.isApproximate == false)
+    #expect(series.summary.isLowerBound == false)
 }
 
 @Test("Trend returns an empty series list when no sample matches the filters")
@@ -290,6 +291,59 @@ func trendLegacyFallback() throws {
     #expect(result.series.first?.summary.tokens.totalTokens == 42)
     #expect(result.series.first?.summary.isApproximate == true)
     #expect(result.warnings.contains { $0.contains("旧报告") })
+}
+
+@Test("Trend preserves lower bounds independently of complete observed-token pricing", arguments: [false, true])
+func trendLowerBoundKeepsObservedPriceCoverage(legacy: Bool) throws {
+    let complete = try trendReport(samples: [
+        trendSample(
+            "2026-08-20T10:00:00Z",
+            model: "gpt-5.6-sol",
+            effort: "medium",
+            tier: "default",
+            usage: trendUsage(input: 100)
+        )
+    ], id: "complete")
+    let sample = trendSample(
+        "2026-08-21T10:00:00Z",
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        tier: "default",
+        usage: trendUsage(input: 200)
+    )
+    let segment = trendSegment(
+        "2026-08-21T10:00:00Z",
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        tier: "default",
+        usage: trendUsage(input: 200)
+    )
+    let lowerBound = try trendReport(
+        samples: legacy ? nil : [sample],
+        segments: legacy ? [segment] : [],
+        id: "lower-bound",
+        usageIsLowerBound: true
+    )
+    let result = try trendAggregator().aggregate(
+        reports: [complete, lowerBound],
+        filter: UsageTrendFilter(
+            startMinute: try trendDate("2026-08-20T10:00:00Z"),
+            endMinute: try trendDate("2026-08-22T10:00:00Z")
+        )
+    )
+    let series = try #require(result.series.first)
+
+    #expect(series.summary.isLowerBound)
+    #expect(series.summary.isApproximate == legacy)
+    #expect(series.summary.tokens.totalTokens == 300)
+    #expect(series.summary.credits.pricedTokens == 300)
+    #expect(series.summary.apiUSD.pricedTokens == 300)
+    #expect(!series.summary.credits.isPartial)
+    #expect(!series.summary.apiUSD.isPartial)
+    #expect(!series.summary.credits.isSuppressed)
+    #expect(!series.summary.apiUSD.isSuppressed)
+    #expect(series.points.map(\.aggregate.isLowerBound) == [false, true, false])
+    #expect(result.warnings.contains { $0.contains("统计是已观测下界") })
 }
 
 @Test("Bundled parser emits minute samples and bounded image-generation details")
@@ -651,7 +705,8 @@ private func trendReport(
     segments: [[String: Any]] = [],
     id: String = UUID().uuidString,
     generatedAt: String = "2026-08-20T12:00:00Z",
-    costSuppressed: Bool = false
+    costSuppressed: Bool = false,
+    usageIsLowerBound: Bool = false
 ) throws -> UsageReport {
     let sampleUsage = samples?.compactMap { $0["usage"] as? [String: Any] } ?? []
     let segmentUsage = segments.compactMap { $0["usage"] as? [String: Any] }
@@ -669,7 +724,7 @@ private func trendReport(
         "segments": segments,
         "cost": ["cost_suppressed": costSuppressed],
         "linked_agent_threads": 0,
-        "usage_is_lower_bound": false
+        "usage_is_lower_bound": usageIsLowerBound
     ]
     if let samples { task["usage_samples"] = samples }
     let root: [String: Any] = [

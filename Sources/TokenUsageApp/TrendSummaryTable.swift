@@ -47,6 +47,12 @@ struct TrendSummaryTable: View {
                                         .font(.caption2)
                                         .foregroundStyle(.orange)
                                 }
+                                if series.summary.isLowerBound {
+                                    Text("下界")
+                                        .font(.caption2)
+                                        .foregroundStyle(.orange)
+                                        .help("部分用量缺少可靠记录；Token 和价格仅包含已记录的用量。")
+                                }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -161,6 +167,7 @@ struct TrendSummaryTable: View {
         [
             coverageHelpLine("Credits", summary: credits),
             coverageHelpLine("API", summary: apiUSD),
+            "覆盖率仅针对已记录的 Token；100% 不代表用量记录完整，价格也不代表实际账单。",
             "计数校验抑价表示为了避免用不可靠的 token 差值算钱而主动隐藏价格；价目未覆盖表示缺少对应模型的公开价格。"
         ].joined(separator: "\n")
     }

@@ -2259,7 +2259,6 @@ def build_report(
         "reconciliation failed",
         "boundary could not be resolved",
         "baseline exceeded",
-        "first token increment was unavailable",
     )
     severe_warnings = [
         warning
@@ -2272,6 +2271,16 @@ def build_report(
         current_cost = _invalidate_cost(current_cost, reason)
         task_cost = _invalidate_cost(task_cost, reason)
 
+    # An ambiguous first fork increment is excluded before any segment or
+    # minute sample is recorded. It makes the observed total a lower bound,
+    # but does not invalidate later deltas against the retained baseline or
+    # independently measured child threads. Keep pricing that safe subtotal.
+    missing_first_fork_increment = any(
+        "first token increment was unavailable" in warning
+        for summary in summaries.values()
+        for warning in summary.get("warnings", [])
+    )
+
     current_provisional = bool(
         selected_turn
         and any(not turn.get("completed_at") and not turn.get("aborted") for turn in current_turns)
@@ -2281,6 +2290,7 @@ def build_report(
         or missing_threads
         or graph_warnings
         or severe_warnings
+        or missing_first_fork_increment
         or any(summary.get("parse_errors") for summary in summaries.values())
         or any(_as_int(summary.get("active_turn_count")) for summary in summaries.values())
         or any(not summary.get("exclusive_usage_available", True) for summary in summaries.values())

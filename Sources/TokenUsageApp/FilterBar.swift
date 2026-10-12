@@ -24,25 +24,31 @@ struct FilterBar: View {
 
             Divider().frame(height: 24)
 
-            DatePicker(
-                "开始",
-                selection: dateBinding(\.startDate),
-                displayedComponents: [.date, .hourAndMinute]
-            )
-            .datePickerStyle(.compact)
-            .fixedSize()
+            if viewModel.isWaitingForLimitPeriod {
+                Text("等待当前额度周期")
+                    .foregroundStyle(.secondary)
+                    .help("读取到有效额度快照后会自动使用当前周期。也可以选择其他日期范围。")
+            } else {
+                DatePicker(
+                    "开始",
+                    selection: dateBinding(\.startDate),
+                    displayedComponents: [.date, .hourAndMinute]
+                )
+                .datePickerStyle(.compact)
+                .fixedSize()
 
-            Image(systemName: "arrow.right")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+                Image(systemName: "arrow.right")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
 
-            DatePicker(
-                "结束",
-                selection: dateBinding(\.endDate),
-                displayedComponents: [.date, .hourAndMinute]
-            )
-            .datePickerStyle(.compact)
-            .fixedSize()
+                DatePicker(
+                    "结束",
+                    selection: dateBinding(\.endDate),
+                    displayedComponents: [.date, .hourAndMinute]
+                )
+                .datePickerStyle(.compact)
+                .fixedSize()
+            }
 
             if showsTokenRange {
                 Picker("Token 口径", selection: $viewModel.filter.tokenScope) {
@@ -93,8 +99,7 @@ struct FilterBar: View {
         Binding(
             get: { viewModel.filter[keyPath: keyPath] },
             set: { value in
-                viewModel.filter[keyPath: keyPath] = value
-                viewModel.markDateRangeCustom()
+                viewModel.setCustomDate(value, for: keyPath)
             }
         )
     }

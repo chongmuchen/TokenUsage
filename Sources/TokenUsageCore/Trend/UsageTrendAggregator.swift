@@ -190,6 +190,7 @@ public struct UsageTrendAggregator: Sendable {
         switch normalizedText(tier)?.lowercased() {
         case "default", "standard": .standard
         case "fast", "priority": .fast
+        case "ultrafast": .ultrafast
         default: .unknown
         }
     }

@@ -53,17 +53,20 @@ public struct CodexCreditRates: Decodable, Sendable {
     public let cachedInput: String?
     public let output: String?
     public let fast: FastCreditRates?
+    public let ultrafast: FastCreditRates?
 }
 
 public struct FastCreditRates: Decodable, Sendable {
     public let support: String?
     public let speedMultiplierNominal: String?
+    public let includedUsageMultiplier: String?
     public let billingMultiplier: String?
 }
 
 public struct APIPriceCatalog: Decodable, Sendable {
     public let standard: APIRateGroups?
     public let fast: APIRateGroups?
+    public let ultrafast: APIRateGroups?
     public let longContextThresholdInputTokensExclusive: Int64?
     public let longContextRule: APILongContextRule?
 }
@@ -128,6 +131,7 @@ public struct CreditEstimator: Sendable {
     private let catalog: PricingCatalog
     private let standardTiers: Set<String> = ["default", "standard"]
     private let fastTiers: Set<String> = ["fast", "priority"]
+    private let ultrafastTiers: Set<String> = ["ultrafast"]
 
     public init(catalog: PricingCatalog) {
         self.catalog = catalog
@@ -174,6 +178,9 @@ public struct CreditEstimator: Sendable {
                 selected = (base, .configured)
             case .fast:
                 guard let multiplier = decimal(rates.fast?.billingMultiplier) else { continue }
+                selected = (base * multiplier, .configured)
+            case .ultrafast:
+                guard let multiplier = decimal(rates.ultrafast?.billingMultiplier) else { continue }
                 selected = (base * multiplier, .configured)
             case .fallbackStandard:
                 selected = (base, .standard)
@@ -225,6 +232,11 @@ public struct CreditEstimator: Sendable {
                     continue
                 }
                 selected = (fast, .configured)
+            case .ultrafast:
+                guard let ultrafast = amount(for: segment, api: api, groups: api.ultrafast, unit: unit) else {
+                    continue
+                }
+                selected = (ultrafast, .configured)
             case .fallbackStandard:
                 selected = (standard, .standard)
             }
@@ -262,7 +274,13 @@ public struct CreditEstimator: Sendable {
             } else {
                 pieces.append("Fast")
             }
-        } else if effectiveTiers.contains(.fast) {
+        } else if effectiveTiers == [.ultrafast] {
+            if let speed = entry?.codexCredits?.ultrafast?.speedMultiplierNominal {
+                pieces.append("Ultrafast \(speed)×")
+            } else {
+                pieces.append("Ultrafast")
+            }
+        } else if effectiveTiers.contains(.fast) || effectiveTiers.contains(.ultrafast) {
             pieces.append("混合档位")
         } else if !effectiveTiers.isEmpty {
             // Missing, unknown, and current-config fallback tiers all use the
@@ -289,6 +307,7 @@ public struct CreditEstimator: Sendable {
         }
         if standardTiers.contains(tier) { return .standard }
         if fastTiers.contains(tier) { return .fast }
+        if ultrafastTiers.contains(tier) { return .ultrafast }
         return .fallbackStandard
     }
 
@@ -387,6 +406,7 @@ public struct CreditEstimator: Sendable {
     private enum PricingTier: Hashable {
         case standard
         case fast
+        case ultrafast
         case fallbackStandard
     }
 }

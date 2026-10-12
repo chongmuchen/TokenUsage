@@ -83,6 +83,86 @@ func sessionAndTrendPricingStayConsistent() throws {
     #expect(sessionAPI.isPartial)
 }
 
+@Test("Ultrafast uses its own paid credit and API rates while preserving partial coverage")
+func ultrafastPricingAndTrendFiltering() throws {
+    let catalog = try pricingConsistencyCatalog()
+    #expect(catalog.entry(for: "priced-model")?.value.codexCredits?.fast?.includedUsageMultiplier == "2.5")
+    #expect(catalog.entry(for: "priced-model")?.value.codexCredits?.ultrafast?.includedUsageMultiplier == "8")
+    #expect(catalog.entry(for: "priced-model")?.value.apiUsd?.ultrafast?.short?.input == "6")
+    let samples = [
+        pricingSample(
+            minute: "2026-08-20T10:00:00Z",
+            model: "priced-model",
+            tier: "ultrafast",
+            tierSource: "thread_settings",
+            input: 1_000_000
+        ),
+        pricingSample(
+            minute: "2026-08-20T10:01:00Z",
+            model: "priced-model",
+            tier: "ultrafast",
+            tierSource: "current_config_fallback",
+            input: 1_000_000
+        ),
+        pricingSample(
+            minute: "2026-08-20T10:02:00Z",
+            model: "standard-only-model",
+            tier: "ultrafast",
+            tierSource: "thread_settings",
+            input: 1_000_000
+        ),
+        pricingSample(
+            minute: "2026-08-20T10:03:00Z",
+            model: "priced-model",
+            tier: "fast",
+            tierSource: "thread_settings",
+            input: 500_000
+        )
+    ]
+    let report = try pricingConsistencyReport(samples: samples)
+    let estimator = CreditEstimator(catalog: catalog)
+    let observed = report.task.segments[0]
+    let fallback = report.task.segments[1]
+    let unsupported = report.task.segments[2]
+
+    #expect(estimator.estimate([observed]).amount == Decimal(60))
+    #expect(estimator.estimateAPI([observed]).amount == Decimal(6))
+    #expect(estimator.modelSummary(for: [observed]) == "Priced Model · medium · Ultrafast 8×")
+    #expect(estimator.estimate([fallback]).amount == Decimal(10))
+    #expect(estimator.estimate([fallback]).basis == .standard)
+    #expect(estimator.modelSummary(for: [fallback]) == "Priced Model · medium · Standard")
+    #expect(estimator.estimate([unsupported]).amount == nil)
+    #expect(estimator.estimateAPI([unsupported]).amount == nil)
+
+    let credits = estimator.estimate(report.task.segments)
+    let api = estimator.estimateAPI(report.task.segments)
+    #expect(credits.amount == Decimal(80))
+    #expect(api.amount == Decimal(8))
+    #expect(credits.basis == .mixed)
+    #expect(api.basis == .mixed)
+    #expect(credits.pricedTokens == 2_500_000)
+    #expect(api.pricedTokens == 2_500_000)
+    #expect(credits.totalTokens == 3_500_000)
+    #expect(api.totalTokens == 3_500_000)
+
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    let trend = UsageTrendAggregator(catalog: catalog, calendar: calendar).aggregate(
+        reports: [report],
+        filter: UsageTrendFilter(
+            startMinute: try pricingDate("2026-08-20T10:00:00Z"),
+            endMinute: try pricingDate("2026-08-20T10:03:00Z"),
+            selectedModels: ["priced-model"],
+            selectedSpeeds: [.ultrafast],
+            groupMode: .configuration
+        )
+    )
+    #expect(trend.dimensions.speeds == [.fast, .ultrafast])
+    #expect(trend.series.count == 1)
+    #expect(trend.series.first?.summary.tokens.totalTokens == 2_000_000)
+    #expect(trend.series.first?.summary.credits.amount == Decimal(70))
+}
+
 @Test("Suppressed session and summary rows retain an explicit suppression reason")
 func pricingSuppressionReasonSurvivesTreeAggregation() throws {
     let catalog = try pricingConsistencyCatalog()
@@ -129,7 +209,14 @@ private func pricingConsistencyCatalog() throws -> PricingCatalog {
                     "fast": [
                         "support": "documented",
                         "speed_multiplier_nominal": "1.5",
+                        "included_usage_multiplier": "2.5",
                         "billing_multiplier": "2"
+                    ],
+                    "ultrafast": [
+                        "support": "documented",
+                        "speed_multiplier_nominal": "8",
+                        "included_usage_multiplier": "8",
+                        "billing_multiplier": "6"
                     ]
                 ],
                 "api_usd": [
@@ -147,6 +234,33 @@ private func pricingConsistencyCatalog() throws -> PricingCatalog {
                             "cached_input": "0.2",
                             "cache_write": "2.5",
                             "output": "4"
+                        ]
+                    ],
+                    "ultrafast": [
+                        "short": [
+                            "input": "6",
+                            "cached_input": "0.6",
+                            "cache_write": "7.5",
+                            "output": "12"
+                        ]
+                    ]
+                ]
+            ],
+            "standard-only-model": [
+                "display_name": "Standard Only",
+                "aliases": [],
+                "codex_credits": [
+                    "input": "10",
+                    "cached_input": "1",
+                    "output": "20"
+                ],
+                "api_usd": [
+                    "standard": [
+                        "short": [
+                            "input": "1",
+                            "cached_input": "0.1",
+                            "cache_write": "1.25",
+                            "output": "2"
                         ]
                     ]
                 ]

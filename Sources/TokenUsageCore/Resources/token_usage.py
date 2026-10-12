@@ -55,6 +55,7 @@ COUNT_FIELDS = (
     "tool_calls",
 )
 FAST_TIERS = {"fast", "priority"}
+ULTRAFAST_TIERS = {"ultrafast"}
 STANDARD_TIERS = {"default", "standard"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 CATALOG_PATH = SCRIPT_DIR / "pricing_catalog.json"
@@ -1807,13 +1808,14 @@ def _calculate_cost(segments: Sequence[Dict[str, Any]], catalog: Dict[str, Any])
                 elif tier in STANDARD_TIERS:
                     credit_configured += base
                     credit_configured_priced_tokens += usage["total_tokens"]
-                elif tier in FAST_TIERS:
-                    fast = credit.get("fast") if isinstance(credit.get("fast"), dict) else {}
-                    multiplier = _decimal(fast.get("billing_multiplier"))
+                elif tier in FAST_TIERS or tier in ULTRAFAST_TIERS:
+                    tier_key = "ultrafast" if tier in ULTRAFAST_TIERS else "fast"
+                    tier_rates = credit.get(tier_key) if isinstance(credit.get(tier_key), dict) else {}
+                    multiplier = _decimal(tier_rates.get("billing_multiplier"))
                     if multiplier is None:
                         credit_configured_complete = False
                         warnings.append(
-                            "Codex Fast billing multiplier was not published for this model; "
+                            f"Codex {tier_key.title()} billing multiplier was not published for this model; "
                             "the configured-tier credit estimate is incomplete"
                         )
                     else:
@@ -1890,20 +1892,22 @@ def _calculate_cost(segments: Sequence[Dict[str, Any]], catalog: Dict[str, Any])
             elif tier in STANDARD_TIERS:
                 api_configured += base
                 api_configured_priced_tokens += usage["total_tokens"]
-            elif tier in FAST_TIERS:
-                fast_group = api.get("fast") if isinstance(api.get("fast"), dict) else None
-                fast_rates = fast_group.get(length_key) if fast_group else None
-                if not isinstance(fast_rates, dict):
+            elif tier in FAST_TIERS or tier in ULTRAFAST_TIERS:
+                tier_key = "ultrafast" if tier in ULTRAFAST_TIERS else "fast"
+                tier_group = api.get(tier_key) if isinstance(api.get(tier_key), dict) else None
+                tier_rates = tier_group.get(length_key) if tier_group else None
+                if not isinstance(tier_rates, dict):
                     api_configured_complete = False
                     warnings.append(
-                        "API Fast pricing was not published for this model; only the Standard equivalent is available"
+                        f"API {tier_key.title()} pricing was not published for this model; "
+                        "only the Standard equivalent is available"
                     )
                 else:
-                    fast_value = price_with_rates(fast_rates)
-                    if fast_value is None:
+                    tier_value = price_with_rates(tier_rates)
+                    if tier_value is None:
                         api_configured_complete = False
                     else:
-                        api_configured += fast_value
+                        api_configured += tier_value
                         api_configured_priced_tokens += usage["total_tokens"]
             else:
                 api_configured_complete = False
@@ -1938,7 +1942,7 @@ def _calculate_cost(segments: Sequence[Dict[str, Any]], catalog: Dict[str, Any])
         "api_standard_priced_tokens": api_standard_priced_tokens,
         "api_configured_priced_tokens": api_configured_priced_tokens,
         # Standard-price coverage and configured-tier coverage are different.
-        # A model may have a Standard price while its Fast multiplier/rate is
+        # A model may have a Standard price while its configured tier multiplier/rate is
         # unknown, so expose both instead of silently treating the configured
         # subtotal as a complete lower bound.
         "credit_configured_unpriced_tokens": max(
@@ -2404,11 +2408,15 @@ def _segment_labels(segments: Sequence[Dict[str, Any]], catalog: Dict[str, Any])
             "thread_settings": "线程设置",
             "current_config_fallback": "按当前配置推断",
         }.get(tier_source, "来源未知")
-        if tier in FAST_TIERS:
+        if tier in FAST_TIERS or tier in ULTRAFAST_TIERS:
+            tier_key = "ultrafast" if tier in ULTRAFAST_TIERS else "fast"
+            tier_name = "Ultrafast" if tier_key == "ultrafast" else "Fast"
             speed = None
             if entry:
-                speed = entry.get("codex_credits", {}).get("fast", {}).get("speed_multiplier_nominal")
-            tier_text = f"Fast {speed or '?'}×（{source_text}）"
+                credit = entry.get("codex_credits") or {}
+                tier_rates = credit.get(tier_key) or {}
+                speed = tier_rates.get("speed_multiplier_nominal")
+            tier_text = f"{tier_name} {speed or '?'}×（{source_text}）"
         elif tier in STANDARD_TIERS:
             tier_text = f"Standard 1.0×（{source_text}）"
         else:
@@ -2507,6 +2515,7 @@ def _hover_model_text(segments: Sequence[Dict[str, Any]], catalog: Dict[str, Any
         .replace(" · ", "·")
         .replace("Standard 1.0×", "Std1×")
         .replace("Fast 1.5×", "Fast1.5×")
+        .replace("Ultrafast ", "Ultrafast")
         .replace("（按当前配置推断）", "(推)")
         .replace("（线程设置）", "")
         .replace("（服务端确认）", "")
@@ -2645,6 +2654,10 @@ def _compact_cost_notes(current_cost: Dict[str, Any], task_cost: Dict[str, Any])
         notes.append("官方价目冲突，采用总价目页")
     if any("API Fast pricing was not published" in warning for warning in cost_warnings):
         notes.append("API Fast 同档价未公布")
+    if any("API Ultrafast pricing was not published" in warning for warning in cost_warnings):
+        notes.append("API Ultrafast 同档价未公布")
+    if any("Codex Ultrafast billing multiplier was not published" in warning for warning in cost_warnings):
+        notes.append("Codex Ultrafast 付费倍率未公布")
     if any("current config fallback" in warning for warning in cost_warnings):
         notes.append("档位仅按当前配置推断")
     if _as_int(task_cost.get("credit_unpriced_tokens")) or _as_int(task_cost.get("api_unpriced_tokens")):
@@ -2666,7 +2679,9 @@ def _hover_model_multiplier_rows(
 ) -> Tuple[str, str]:
     models: List[str] = []
     model_ids: set[str] = set()
+    tiers: List[str] = []
     speeds: List[str] = []
+    included: List[str] = []
     billing: List[str] = []
     efforts: List[str] = []
     groups = _segment_usage_labels(segments, catalog)
@@ -2684,23 +2699,40 @@ def _hover_model_multiplier_rows(
             efforts.append(effort)
         tier = segment.get("tier")
         if tier in STANDARD_TIERS:
+            tier_text = "Standard"
             speed_text = "1×"
+            included_text = "1×"
             billing_text = "1×"
-        elif tier in FAST_TIERS:
-            fast = entry.get("codex_credits", {}).get("fast", {}) if entry else {}
-            speed = _decimal(fast.get("speed_multiplier_nominal"))
-            multiplier = _decimal(fast.get("billing_multiplier"))
+        elif tier in FAST_TIERS or tier in ULTRAFAST_TIERS:
+            tier_key = "ultrafast" if tier in ULTRAFAST_TIERS else "fast"
+            tier_text = "Ultrafast" if tier_key == "ultrafast" else "Fast"
+            credit = (entry.get("codex_credits") or {}) if entry else {}
+            tier_rates = credit.get(tier_key) or {}
+            speed = _decimal(tier_rates.get("speed_multiplier_nominal"))
+            included_multiplier = _decimal(tier_rates.get("included_usage_multiplier"))
+            multiplier = _decimal(tier_rates.get("billing_multiplier"))
             speed_text = (_hover_decimal_value(speed) + "×") if speed is not None else "?"
+            included_text = (
+                (_hover_decimal_value(included_multiplier) + "×")
+                if included_multiplier is not None else "?"
+            )
             billing_text = (_hover_decimal_value(multiplier) + "×") if multiplier is not None else "?"
         else:
-            speed_text = billing_text = "?"
+            tier_text = "未知"
+            speed_text = included_text = billing_text = "?"
+        if segment.get("tier_source") == "current_config_fallback":
+            tier_text += "(推)"
+        if tier_text not in tiers:
+            tiers.append(tier_text)
         if speed_text not in speeds:
             speeds.append(speed_text)
+        if included_text not in included:
+            included.append(included_text)
         if billing_text not in billing:
             billing.append(billing_text)
 
     if not models:
-        return "模型/档位未知", "倍率速度?·额度?"
+        return "模型/档位未知", "档位未知·速度?·订阅用量?·付费Credits?"
     if len(models) <= 2:
         model_text = "+".join(models)
     else:
@@ -2712,9 +2744,13 @@ def _hover_model_multiplier_rows(
         return (1, Decimal(0)) if number is None else (0, number)
 
     speeds.sort(key=multiplier_order)
+    included.sort(key=multiplier_order)
     billing.sort(key=multiplier_order)
     model_row = f"模型{model_text}{group_suffix}{effort_suffix}"
-    multiplier_row = f"倍率速度{'/'.join(speeds)}·额度{'/'.join(billing)}"
+    multiplier_row = (
+        f"档位{'/'.join(tiers)}·速度{'/'.join(speeds)}"
+        f"·订阅用量{'/'.join(included)}·付费Credits{'/'.join(billing)}"
+    )
     return model_row, multiplier_row
 
 
@@ -2889,15 +2925,19 @@ def _hover_short_model_multiplier(
     else:
         model_text = f"混{len(model_names)}模"
 
-    multiplier_value = multiplier_row.removeprefix("倍率速度")
-    speed_value, separator, billing_value = multiplier_value.partition("·额度")
-    if not separator:
-        speed_value = billing_value = "?"
+    tier_value, tier_separator, multiplier_value = multiplier_row.removeprefix("档位").partition("·速度")
+    speed_value, speed_separator, multiplier_value = multiplier_value.partition("·订阅用量")
+    included_value, included_separator, billing_value = multiplier_value.partition("·付费Credits")
+    if not all((tier_separator, speed_separator, included_separator)):
+        tier_value = speed_value = included_value = billing_value = "?"
 
     def values(text: str) -> str:
         return "/".join(value.removesuffix("×") for value in text.split("/"))
 
-    return f"速×{values(speed_value)}·额×{values(billing_value)}·{model_text}"
+    return (
+        f"{tier_value}·速×{values(speed_value)}·订额×{values(included_value)}"
+        f"·付费Cr×{values(billing_value)}·{model_text}"
+    )
 
 
 def _hover_scope_rows(
@@ -3037,8 +3077,12 @@ def _hover_note_rows(report: Dict[str, Any]) -> List[str]:
         rows.append("价目冲突采用官方总价表")
     if any("Fast pricing was not published" in warning for warning in warnings):
         rows.append("部分Fast API价格未公开")
+    if any("Ultrafast pricing was not published" in warning for warning in warnings):
+        rows.append("部分Ultrafast API价格未公开")
     if any("Fast billing multiplier was not published" in warning for warning in warnings):
-        rows.append("部分Fast额度倍率未公开")
+        rows.append("部分Fast付费Credits倍率未公开")
+    if any("Ultrafast billing multiplier was not published" in warning for warning in warnings):
+        rows.append("部分Ultrafast付费Credits倍率未公开")
     if any("cache-write" in warning for warning in warnings):
         rows.append("缓存写价格按公开规则估算")
     if not suppressed and any("counter invariants failed" in warning for warning in warnings):
@@ -3215,8 +3259,8 @@ def format_full(report: Dict[str, Any]) -> str:
             "  Web/File Search、容器、图片生成、外部 MCP 等按次/存储费用未计入。",
             "",
             "准确度",
-            "  Credits 为官方 Codex rate card 估算；API USD 是等价估算，不是订阅实际账单。",
-            "  Fast/Standard 数值是按线程设置估算；transcript 不含提供商最终 effective tier。",
+            "  Credits 按官方付费价估算；订阅内用量另按独立倍率计算；API USD 是等价估算，不是实际账单。",
+            "  Standard/Fast/Ultrafast 数值是按线程设置估算；transcript 不含提供商最终 effective tier。",
             f"  价格目录 {report.get('pricing_catalog', {}).get('catalog_id')}；"
             f"范围：{report.get('pricing_catalog', {}).get('scope') or '未声明'}",
         ]

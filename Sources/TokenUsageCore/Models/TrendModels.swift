@@ -49,6 +49,7 @@ public struct UsageSample: Codable, Equatable, Hashable, Sendable {
 public enum UsageTrendSpeed: String, Codable, CaseIterable, Identifiable, Sendable {
     case standard
     case fast
+    case ultrafast
     case unknown
 
     public var id: String { rawValue }
@@ -57,6 +58,7 @@ public enum UsageTrendSpeed: String, Codable, CaseIterable, Identifiable, Sendab
         switch self {
         case .standard: "Standard"
         case .fast: "Fast"
+        case .ultrafast: "Ultrafast"
         case .unknown: "未知速度"
         }
     }

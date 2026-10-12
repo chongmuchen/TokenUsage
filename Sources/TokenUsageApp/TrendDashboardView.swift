@@ -464,7 +464,7 @@ enum TrendPriceMetric: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .apiUSD: "API USD 等价"
-        case .credits: "Credits 估算"
+        case .credits: "付费 Credits 估算"
         }
     }
 }
@@ -731,7 +731,7 @@ private struct TrendPriceChart: View {
 
         TrendCard(
             title: "每日价格",
-            subtitle: "公开价估算；Credits 与 API USD 是两种口径，不应相加。"
+            subtitle: "Credits 按付费公开价估算；订阅内用量另按独立倍率计算；Credits 与 API USD 不应相加。"
         ) {
             Picker("价格指标", selection: $metric) {
                 ForEach(TrendPriceMetric.allCases) { metric in

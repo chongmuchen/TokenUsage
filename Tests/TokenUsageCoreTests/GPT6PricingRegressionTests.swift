@@ -2,21 +2,23 @@ import Foundation
 import Testing
 @testable import TokenUsageCore
 
-@Test("GPT-6 Sol and Luna retain exact cache and context pricing across Python and Swift")
+@Test("GPT-6.1 Sol, GPT-6 Sol, and Luna retain exact cache and context pricing across Python and Swift")
 func gpt6PricingMatchesParserAtLongContextBoundary() throws {
     let catalog = try PricingCatalog.bundled()
     let estimator = CreditEstimator(catalog: catalog)
     let results = try gpt6ParserPricing()
-    #expect(results.count == 12)
+    #expect(results.count == 18)
 
     // Each request has 50,000 cached reads, 20,000 cache writes, and 10,000
     // output tokens (including 4,000 reasoning tokens). Expected amounts are
     // independent totals, so charging cache writes or reasoning twice fails.
     let expected: [String: (apiStandard: String, apiFast: String, creditsStandard: String, creditsFast: String)] = [
-        "gpt-6-sol:272000": ("0.564", "1.128", "13.85", "34.625"),
-        "gpt-6-sol:272001": ("1.078004", "2.156008", "13.85005", "34.625125"),
-        "gpt-6-luna:272000": ("0.0282", "0.0564", "0.6925", "1.73125"),
-        "gpt-6-luna:272001": ("0.0539002", "0.1078004", "0.6925025", "1.73125625")
+        "gpt-6.1-sol:272000": ("0.559", "1.118", "13.725", "27.45"),
+        "gpt-6.1-sol:272001": ("1.068004", "2.136008", "13.72505", "27.4501"),
+        "gpt-6-sol:272000": ("0.564", "1.128", "13.85", "27.7"),
+        "gpt-6-sol:272001": ("1.078004", "2.156008", "13.85005", "27.7001"),
+        "gpt-6-luna:272000": ("0.0282", "0.0564", "0.6925", "1.385"),
+        "gpt-6-luna:272001": ("0.0539002", "0.1078004", "0.6925025", "1.385005")
     ]
 
     for result in results {
@@ -53,7 +55,7 @@ func gpt6PricingMatchesParserAtLongContextBoundary() throws {
     }
 }
 
-@Test("Catalog updates replay previously unknown GPT-6 model caches and retain current caches")
+@Test("Catalog updates replay previously unknown GPT-6 family caches and retain current caches")
 func gpt6CatalogChangeRebuildsLongContextCache() throws {
     let code = """
         import copy, json, os, runpy, sys, tempfile
@@ -63,7 +65,7 @@ func gpt6CatalogChangeRebuildsLongContextCache() throws {
         current = ns["_load_catalog"]()
         previous = copy.deepcopy(current)
         previous["catalog_id"] = "openai-public-2026-09-05"
-        for model in ("gpt-6-sol", "gpt-6-luna"):
+        for model in ("gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"):
             del previous["models"][model]
         globals_ = ns["parse_transcript"].__globals__
         original_process_record = globals_["_process_record"]
@@ -82,7 +84,7 @@ func gpt6CatalogChangeRebuildsLongContextCache() throws {
             os.environ["CODEX_TOKEN_USAGE_STATE_DIR"] = str(root / "token-usage")
             sessions = root / "sessions"
             sessions.mkdir()
-            for model in ("gpt-6-sol", "gpt-6-luna"):
+            for model in ("gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"):
                 transcript = sessions / ("rollout-" + model + ".jsonl")
                 usage = {
                     "input_tokens": 300000, "cached_input_tokens": 50000,
@@ -137,7 +139,9 @@ func gpt6CatalogChangeRebuildsLongContextCache() throws {
         [GPT6ParserPrice].self,
         from: gpt6RunParserCode(code)
     )
-    #expect(results.count == 2)
+    #expect(results.count == 3)
+    #expect(results.first { $0.segment.model == "gpt-6.1-sol" }?.cost.apiUsdStandardEquivalent == "1.180000")
+    #expect(results.first { $0.segment.model == "gpt-6.1-sol" }?.cost.codexCreditsStandardEquivalent == "15.125000")
     #expect(results.first { $0.segment.model == "gpt-6-sol" }?.cost.apiUsdStandardEquivalent == "1.190000")
     #expect(results.first { $0.segment.model == "gpt-6-luna" }?.cost.apiUsdStandardEquivalent == "0.059500")
 }
@@ -154,7 +158,7 @@ private func gpt6ParserPricing() throws -> [GPT6ParserPrice] {
         ns = runpy.run_path(sys.argv[1])
         catalog = ns["_load_catalog"]()
         results = []
-        for model in ("gpt-6-sol", "gpt-6-luna"):
+        for model in ("gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"):
             for tier in ("standard", "fast", "priority"):
                 for input_tokens in (272000, 272001):
                     usage = {

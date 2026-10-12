@@ -32,7 +32,7 @@ struct TrendFilterBar: View {
                 },
                 selection: $viewModel.selectedTrendSpeeds
             )
-            .help("速度来自会话记录中的 Standard / Fast 档位；未知档位会单独保留。")
+            .help("速度来自会话记录中的 Standard / Fast / Ultrafast 档位；未知档位会单独保留。")
 
             Divider().frame(height: 24)
 

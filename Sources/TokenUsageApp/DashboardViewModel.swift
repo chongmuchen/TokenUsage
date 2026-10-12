@@ -39,7 +39,9 @@ final class DashboardViewModel: ObservableObject {
     @Published private(set) var isSyncingHistory = false
     @Published private(set) var historyProgress: HistoricalSyncProgress?
     @Published private(set) var historyMessage: String?
-    @Published var filter = UsageFilter()
+    @Published var filter: UsageFilter {
+        didSet { dateSelectionStore.save(filter) }
+    }
     @Published var trendGroupMode: UsageTrendGroupMode = .all
     @Published var selectedTrendModels: Set<String> = []
     @Published var selectedTrendEfforts: Set<String> = []
@@ -52,6 +54,7 @@ final class DashboardViewModel: ObservableObject {
     private let titleStore = ThreadTitleStore()
     private let historyGenerator = HistoricalReportGenerator()
     private let bookmarkStore: SecurityScopedBookmarkStore
+    private let dateSelectionStore: UsageDateSelectionStore
     private let builder: UsageTreeBuilder
     private let trendAggregator: UsageTrendAggregator
     private let weeklyLimitEstimator: WeeklyLimitEstimator
@@ -65,6 +68,7 @@ final class DashboardViewModel: ObservableObject {
 
     init() {
         let bookmarkStore = SecurityScopedBookmarkStore()
+        let dateSelectionStore = UsageDateSelectionStore()
         let homes = bookmarkStore.loadHomes()
         let catalog = (try? PricingCatalog.bundled()) ?? PricingCatalog(
             schemaVersion: 1,
@@ -75,6 +79,8 @@ final class DashboardViewModel: ObservableObject {
             models: [:]
         )
         self.bookmarkStore = bookmarkStore
+        self.dateSelectionStore = dateSelectionStore
+        self.filter = dateSelectionStore.load()
         self.builder = UsageTreeBuilder(catalog: catalog)
         self.trendAggregator = UsageTrendAggregator(catalog: catalog)
         self.weeklyLimitEstimator = WeeklyLimitEstimator(catalog: catalog)
@@ -184,6 +190,7 @@ final class DashboardViewModel: ObservableObject {
     var statusText: String {
         if isLoading { return "正在读取报告…" }
         if let errorMessage { return errorMessage }
+        if isWaitingForLimitPeriod { return "等待当前额度周期…" }
         if !loadIssues.isEmpty { return "已保留可用报告；\(loadIssues.count) 个文件或目录读取失败" }
         if duplicateSessionCount > 0 {
             return "显示 \(filteredSessions.count) / \(sessions.count) 个会话；已合并 \(duplicateSessionCount) 个跨目录重复会话"
@@ -203,6 +210,10 @@ final class DashboardViewModel: ObservableObject {
 
     var hasActiveLimitPeriod: Bool { currentLimitPeriod != nil }
 
+    var isWaitingForLimitPeriod: Bool {
+        filter.preset == .limitPeriod && !hasActiveLimitPeriod
+    }
+
     /// A compact description suitable for a toolbar or settings summary.
     var codexHomePathSummary: String {
         if homes.count == 1 { return homes[0].pathSummary }
@@ -211,18 +222,18 @@ final class DashboardViewModel: ObservableObject {
 
     func applyPreset(_ preset: DatePreset) {
         if preset == .limitPeriod {
-            guard let period = currentLimitPeriod else {
-                if filter.preset == .limitPeriod { filter.preset = .custom }
-                return
-            }
+            guard let period = currentLimitPeriod else { return }
             _ = filter.applyLimitPeriod(start: period.start, endExclusive: period.end)
             return
         }
         filter.apply(preset)
     }
 
-    func markDateRangeCustom() {
-        if filter.preset != .custom { filter.preset = .custom }
+    func setCustomDate(_ value: Date, for keyPath: WritableKeyPath<UsageFilter, Date>) {
+        var updated = filter
+        updated[keyPath: keyPath] = value
+        updated.preset = .custom
+        filter = updated
     }
 
     /// Backwards-compatible toolbar action. Selecting a directory now adds it
@@ -523,6 +534,13 @@ final class DashboardViewModel: ObservableObject {
     /// missed (for example during process startup), so the retry also repairs
     /// the directory subscription before loading.
     func refreshIfReportsChanged() {
+        // Reopening a still-running app should also resolve relative shortcuts
+        // against the current day, even when no report files have changed.
+        if [.today, .week, .month].contains(filter.preset) {
+            var updated = filter
+            updated.apply(filter.preset)
+            if updated != filter { filter = updated }
+        }
         guard !isLoading else { return }
         let sources = homes + automaticCodexHomes(excluding: homes)
         let currentFingerprint = reportFingerprint(for: sources)
@@ -550,7 +568,7 @@ final class DashboardViewModel: ObservableObject {
     }
 
     func syncVisibleDateRange() {
-        guard !isSyncingHistory else { return }
+        guard !isSyncingHistory, !isWaitingForLimitPeriod else { return }
         let range = filter.minuteRange()
         let lower = range.lower
         let upper = range.upperExclusive

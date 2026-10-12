@@ -27,7 +27,8 @@ struct TrendSummaryTable: View {
                         header("非缓存输入")
                         header("缓存读 / 写")
                         header("输出 / 推理")
-                        header("Credits")
+                        header("付费 Credits")
+                            .help("按公开付费 Credits 价估算；订阅内用量另按独立倍率计算。")
                         header("API USD 等价")
                         header("覆盖率（Cr / API）")
                     }

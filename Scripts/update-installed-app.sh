@@ -54,19 +54,35 @@ validate_identity() {
     [[ "$candidate_bundle_id" == "$expected_bundle_id" ]]
 }
 
+resource_dir_for() {
+    local bundle="$1/$resource_bundle_relative"
+    local modern="$bundle/Contents/Resources"
+    if [[ -f "$modern/token_usage.py" && -f "$modern/pricing_catalog.json" ]]; then
+        print -r -- "$modern"
+    elif [[ -f "$bundle/token_usage.py" && -f "$bundle/pricing_catalog.json" ]]; then
+        # Older SwiftPM versions placed the bundle's resources at its root.
+        print -r -- "$bundle"
+    else
+        return 1
+    fi
+}
+
 verify_install_candidate() {
     local candidate=$1
     validate_identity "$candidate" || return 1
     /usr/bin/codesign --verify --deep --strict --verbose=2 "$candidate" || return 1
+    local built_resources candidate_resources
+    built_resources=$(resource_dir_for "$built_app") || return 1
+    candidate_resources=$(resource_dir_for "$candidate") || return 1
     /usr/bin/cmp -s \
         "$built_app/Contents/MacOS/$executable_name" \
         "$candidate/Contents/MacOS/$executable_name" \
         && /usr/bin/cmp -s \
-            "$built_app/$resource_bundle_relative/token_usage.py" \
-            "$candidate/$resource_bundle_relative/token_usage.py" \
+            "$built_resources/token_usage.py" \
+            "$candidate_resources/token_usage.py" \
         && /usr/bin/cmp -s \
-            "$built_app/$resource_bundle_relative/pricing_catalog.json" \
-            "$candidate/$resource_bundle_relative/pricing_catalog.json"
+            "$built_resources/pricing_catalog.json" \
+            "$candidate_resources/pricing_catalog.json"
 }
 
 hook_pair_matches() {
@@ -98,8 +114,9 @@ hook_pair_matches_git_history() {
 }
 
 prepare_hook_update() {
-    local built_resources="$built_app/$resource_bundle_relative"
-    local installed_resources="$installed_app/$resource_bundle_relative"
+    local built_resources installed_resources
+    built_resources=$(resource_dir_for "$built_app") || return 1
+    installed_resources=$(resource_dir_for "$installed_app") || installed_resources=""
 
     [[ -e "$hook_parser" || -e "$hook_catalog" ]] || return 0
     if [[ -L "$hook_parser" || ! -f "$hook_parser" \
@@ -131,7 +148,8 @@ prepare_hook_update() {
 
 sync_hook_resources() {
     [[ "$hook_update_mode" == "update" ]] || return 0
-    local installed_resources="$installed_app/$resource_bundle_relative"
+    local installed_resources
+    installed_resources=$(resource_dir_for "$installed_app") || return 1
     local built_parser="$installed_resources/token_usage.py"
     local built_catalog="$installed_resources/pricing_catalog.json"
     local hook_directory="${hook_parser:h}"

@@ -685,7 +685,7 @@ private struct CreditsCell: View {
 
     private func helpText(_ estimate: CreditEstimate) -> String {
         var lines = [
-            "\(estimate.basis.rawValue)估算；不是订阅实际扣款",
+            "\(estimate.basis.rawValue)按公开付费 Credits 价估算；订阅内用量另按独立倍率计算；不是实际扣款",
             "配置档位来自本地会话记录，不代表服务端最终执行档位"
         ]
         if estimate.isPartial {

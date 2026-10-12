@@ -685,7 +685,7 @@ func creditsAndAPIPricesAreBothEstimated(model: String) throws {
         lastAt: nil,
         requestCount: 1
     )
-    #expect(estimator.estimate([fast]).amount == Decimal(330) * priceMultiplier)
+    #expect(estimator.estimate([fast]).amount == Decimal(264) * priceMultiplier)
     #expect(estimator.estimateAPI([fast]).amount == Decimal(string: "10.76")! * priceMultiplier)
     if model == "gpt-6-astra" {
         #expect(estimator.modelSummary(for: [fast]) == "GPT-6 Astra · medium · Fast")

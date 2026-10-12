@@ -12,10 +12,10 @@ private struct ExpectedRates {
 func pricingCatalogCurrentSnapshotMetadata() throws {
     let catalog = try PricingCatalog.bundled()
 
-    #expect(catalog.catalogId == "openai-public-2026-09-23")
-    #expect(catalog.observedAt == "2026-09-23")
+    #expect(catalog.catalogId == "openai-public-2026-09-30")
+    #expect(catalog.observedAt == "2026-09-30")
     #expect(catalog.tokenUnit == 1_000_000)
-    #expect(catalog.models.count == 9)
+    #expect(catalog.models.count == 10)
     #expect(catalog.entry(for: "gpt-5.6")?.key == "gpt-5.6-sol")
 }
 
@@ -26,47 +26,57 @@ func pricingCatalogCurrentCreditRates() throws {
     try expectCredits(
         catalog, model: "gpt-6-astra",
         input: "250", cachedInput: "25", output: "1250",
-        fastSupport: "documented", fastMultiplier: "2.5", speedMultiplier: nil
+        fastSupport: "documented", fastMultiplier: "2.0", speedMultiplier: nil
+    )
+    let ultrafast = try #require(catalog.models["gpt-6-astra"]?.codexCredits?.ultrafast)
+    #expect(ultrafast.support == "documented")
+    #expect(ultrafast.speedMultiplierNominal == "8")
+    #expect(ultrafast.includedUsageMultiplier == "8")
+    #expect(ultrafast.billingMultiplier == "6")
+    try expectCredits(
+        catalog, model: "gpt-6.1-sol",
+        input: "50", cachedInput: "2.5", output: "250",
+        fastSupport: "documented", fastMultiplier: "2.0", speedMultiplier: nil
     )
     try expectCredits(
         catalog, model: "gpt-6-sol",
         input: "50", cachedInput: "5", output: "250",
-        fastSupport: "documented", fastMultiplier: "2.5", speedMultiplier: nil
+        fastSupport: "documented", fastMultiplier: "2.0", speedMultiplier: nil
     )
     try expectCredits(
         catalog, model: "gpt-6-luna",
         input: "2.5", cachedInput: "0.25", output: "12.5",
-        fastSupport: "documented", fastMultiplier: "2.5", speedMultiplier: nil
+        fastSupport: "documented", fastMultiplier: "2.0", speedMultiplier: nil
     )
     try expectCredits(
         catalog, model: "gpt-5.6-sol",
         input: "100", cachedInput: "10", output: "500",
-        fastSupport: "documented", fastMultiplier: "2.5"
+        fastSupport: "documented", fastMultiplier: "2.0"
     )
     try expectCredits(
         catalog, model: "gpt-5.6-terra",
         input: "50", cachedInput: "5", output: "300",
-        fastSupport: "documented", fastMultiplier: "2.5"
+        fastSupport: "documented", fastMultiplier: "2.0"
     )
     try expectCredits(
         catalog, model: "gpt-5.6-luna",
         input: "5", cachedInput: "0.5", output: "30",
-        fastSupport: "documented", fastMultiplier: "2.5"
+        fastSupport: "documented", fastMultiplier: "2.0"
     )
     try expectCredits(
         catalog, model: "gpt-5.5",
         input: "125", cachedInput: "12.5", output: "750",
-        fastSupport: "documented_for_chatgpt_codex", fastMultiplier: "2.5"
+        fastSupport: "documented_for_chatgpt_codex", fastMultiplier: "2.0"
     )
     try expectCredits(
         catalog, model: "gpt-5.4",
         input: "62.5", cachedInput: "6.25", output: "375",
-        fastSupport: "documented_for_chatgpt_codex", fastMultiplier: "2.0"
+        fastSupport: "documented_for_chatgpt_codex", fastMultiplier: "2.0", includedMultiplier: nil
     )
     try expectCredits(
         catalog, model: "gpt-5.4-mini",
         input: "18.75", cachedInput: "1.875", output: "113",
-        fastSupport: "not_listed", fastMultiplier: nil, speedMultiplier: nil
+        fastSupport: "not_listed", fastMultiplier: nil, speedMultiplier: nil, includedMultiplier: nil
     )
 }
 
@@ -80,6 +90,16 @@ func pricingCatalogCurrentTieredAPIRates() throws {
         standardLong: .init(input: "20.00", cachedInput: "2.00", cacheWrite: "25.00", output: "75.00"),
         fastShort: .init(input: "20.00", cachedInput: "2.00", cacheWrite: "25.00", output: "100.00"),
         fastLong: .init(input: "40.00", cachedInput: "4.00", cacheWrite: "50.00", output: "150.00")
+    )
+    let ultrafast = try #require(catalog.models["gpt-6-astra"]?.apiUsd?.ultrafast)
+    try expectRates(ultrafast.short, .init(input: "60.00", cachedInput: "6.00", cacheWrite: "75.00", output: "300.00"))
+    try expectRates(ultrafast.long, .init(input: "120.00", cachedInput: "12.00", cacheWrite: "150.00", output: "450.00"))
+    try expectTieredAPI(
+        catalog, model: "gpt-6.1-sol",
+        standardShort: .init(input: "2.00", cachedInput: "0.10", cacheWrite: "2.50", output: "10.00"),
+        standardLong: .init(input: "4.00", cachedInput: "0.20", cacheWrite: "5.00", output: "15.00"),
+        fastShort: .init(input: "4.00", cachedInput: "0.20", cacheWrite: "5.00", output: "20.00"),
+        fastLong: .init(input: "8.00", cachedInput: "0.40", cacheWrite: "10.00", output: "30.00")
     )
     try expectTieredAPI(
         catalog, model: "gpt-6-sol",
@@ -147,7 +167,8 @@ private func expectCredits(
     output: String,
     fastSupport: String,
     fastMultiplier: String?,
-    speedMultiplier: String? = "1.5"
+    speedMultiplier: String? = "1.5",
+    includedMultiplier: String? = "2.5"
 ) throws {
     let rates = try #require(catalog.models[model]?.codexCredits)
     #expect(rates.input == input)
@@ -155,6 +176,7 @@ private func expectCredits(
     #expect(rates.output == output)
     #expect(rates.fast?.support == fastSupport)
     #expect(rates.fast?.speedMultiplierNominal == speedMultiplier)
+    #expect(rates.fast?.includedUsageMultiplier == includedMultiplier)
     #expect(rates.fast?.billingMultiplier == fastMultiplier)
 }
 

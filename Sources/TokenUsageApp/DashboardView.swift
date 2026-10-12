@@ -23,6 +23,13 @@ struct DashboardView: View {
                 loadingState
             } else if let error = viewModel.errorMessage, viewModel.reports.isEmpty {
                 errorState(error)
+            } else if viewModel.isWaitingForLimitPeriod {
+                ContentUnavailableView(
+                    "等待当前额度周期",
+                    systemImage: "clock",
+                    description: Text("读取到有效额度快照后会自动使用当前周期。也可以选择其他日期范围。")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 switch displayMode {
                 case .trend:
@@ -81,7 +88,7 @@ struct DashboardView: View {
             } label: {
                 Label("同步当前日期范围", systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90")
             }
-            .disabled(viewModel.isSyncingHistory)
+            .disabled(viewModel.isSyncingHistory || viewModel.isWaitingForLimitPeriod)
             .help("为当前起止日期内缺失、下界、抑价、缺少限额快照或每日观测、旧价目的会话新建或重建本地报告；不调用模型")
 
             Button {
@@ -203,11 +210,13 @@ struct DashboardView: View {
                     .help(historyMessage)
             }
             Spacer()
-            if displayMode == .sessions {
-                Text("筛选总计 \(TokenFormatter.exact(viewModel.filteredTokenTotal)) tokens")
-                    .monospacedDigit()
-            } else {
-                Text("\(viewModel.trendResult.series.count) 条曲线 · \(viewModel.trendResult.days.count) 天")
+            if !viewModel.isWaitingForLimitPeriod {
+                if displayMode == .sessions {
+                    Text("筛选总计 \(TokenFormatter.exact(viewModel.filteredTokenTotal)) tokens")
+                        .monospacedDigit()
+                } else {
+                    Text("\(viewModel.trendResult.series.count) 条曲线 · \(viewModel.trendResult.days.count) 天")
+                }
             }
             if let observedAt = viewModel.latestUsageObservedAt {
                 Text("·")

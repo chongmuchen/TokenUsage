@@ -54,6 +54,9 @@ public struct DailyQuotaTrend: Sendable {
 public struct DailyQuotaTrendAggregator: Sendable {
     private let calendar: Calendar
     private let priceEstimator: CreditEstimator
+    // Bounds for treating a recovered dip as an approximation, not a reset.
+    private static let maximumTransientDrop = 2.0
+    private static let transientRecoveryInterval: TimeInterval = 5 * 60
 
     public init(catalog: PricingCatalog, calendar: Calendar = .current) {
         self.calendar = calendar
@@ -147,10 +150,13 @@ public struct DailyQuotaTrendAggregator: Sendable {
 
                 let used = segmentUsage(segment, baseline: baseline)
                 if let used, let running = cumulative {
-                    cumulative = running + used
+                    cumulative = running + used.amount
+                    if used.recoveredTransientDrop {
+                        warnings.append("\(dayLabel(day)) 的配额观测出现短暂回退并已恢复；当天使用量按相邻观测近似计算。")
+                    }
                 } else {
                     cumulative = nil
-                    warnings.append("有配额观测在同一周期内下降；对应日期的使用量留空。")
+                    warnings.append("\(dayLabel(day)) 的配额观测在同一周期内下降且无法确认恢复；当天使用量留空。")
                 }
                 while priceCursor < priceEvents.count,
                       priceEvents[priceCursor].at <= last.snapshot.observedAt {
@@ -174,6 +180,7 @@ public struct DailyQuotaTrendAggregator: Sendable {
                     cumulativeUsedPercent: cumulative,
                     usdPerPercent: price?.amount,
                     isApproximate: approximateBaseline
+                        || used?.recoveredTransientDrop == true
                         || segment.contains(where: \.isLegacy)
                         || price?.approximate == true,
                     isReset: reset
@@ -265,14 +272,49 @@ public struct DailyQuotaTrendAggregator: Sendable {
         return segments
     }
 
-    private func segmentUsage(_ observations: [QuotaObservation], baseline: Double) -> Double? {
-        var previous = baseline
+    private func segmentUsage(_ observations: [QuotaObservation], baseline: Double) -> SegmentUsage? {
+        var highWater = baseline
+        // Yesterday's baseline is not evidence of a recent observation within
+        // this segment. A dip must be bracketed by same-day, same-period polls.
+        var highWaterObservedAt: Date?
+        var awaitingRecovery = false
+        var recoveredTransientDrop = false
         for observation in observations {
             let current = observation.snapshot.usedPercent
-            if current + 0.001 < previous { return nil }
-            previous = max(previous, current)
+            let at = observation.snapshot.observedAt
+            if current + 0.001 < highWater {
+                guard let highWaterObservedAt,
+                      highWater - current <= Self.maximumTransientDrop,
+                      at.timeIntervalSince(highWaterObservedAt) <= Self.transientRecoveryInterval
+                else { return nil }
+                awaitingRecovery = true
+                continue
+            }
+            if awaitingRecovery {
+                guard let highWaterObservedAt,
+                      at.timeIntervalSince(highWaterObservedAt) <= Self.transientRecoveryInterval
+                else { return nil }
+                awaitingRecovery = false
+                recoveredTransientDrop = true
+            }
+            highWater = max(highWater, current)
+            highWaterObservedAt = at
         }
-        return max(previous - baseline, 0)
+        guard !awaitingRecovery else { return nil }
+        // Never add the recovery jump as extra usage (20 → 18 → 20 uses 0).
+        return SegmentUsage(
+            amount: max(highWater - baseline, 0),
+            recoveredTransientDrop: recoveredTransientDrop
+        )
+    }
+
+    private func dayLabel(_ day: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: day)
     }
 
     private func priceEvents(in reports: [UsageReport]) -> [PriceEvent] {
@@ -347,6 +389,11 @@ private struct QuotaObservation {
     let snapshot: RateLimitSnapshot
     let period: QuotaPeriod
     let isLegacy: Bool
+}
+
+private struct SegmentUsage {
+    let amount: Double
+    let recoveredTransientDrop: Bool
 }
 
 private struct PriceResult {

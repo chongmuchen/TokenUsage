@@ -125,6 +125,179 @@ func dailyQuotaUnexplainedDropIsGap() throws {
     #expect(result.warnings.contains { $0.contains("下降") })
 }
 
+@Test("A small recovered dip across reports preserves daily quota and price as approximate")
+func dailyQuotaRecoversTransientDipAcrossReports() throws {
+    let leading = try quotaReport(
+        id: "transient-leading",
+        samples: [quotaSample("2026-08-20T09:00:00Z", input: 2_000_000)],
+        observations: [
+            quotaSnapshot("2026-08-19T23:00:00Z", used: 17),
+            quotaSnapshot("2026-08-20T09:40:00Z", used: 20)
+        ]
+    )
+    let delayed = try quotaReport(
+        id: "transient-delayed",
+        observations: [quotaSnapshot("2026-08-20T09:42:00Z", used: 18)]
+    )
+    let recovered = try quotaReport(
+        id: "transient-recovered",
+        observations: [
+            quotaSnapshot("2026-08-20T09:43:00Z", used: 20),
+            quotaSnapshot("2026-08-20T18:00:00Z", used: 49)
+        ]
+    )
+    let result = try quotaTrend(
+        [recovered, delayed, leading],
+        from: "2026-08-20T00:00:00Z", through: "2026-08-20T23:00:00Z"
+    )
+
+    let point = try #require(result.points.first)
+    #expect(result.points.count == 1)
+    #expect(point.startRemainingPercent == 83)
+    #expect(point.cumulativeUsedPercent == 32)
+    #expect(point.usdPerPercent == Decimal(string: "0.0625"))
+    #expect(point.observedAt == quotaDate("2026-08-20T18:00:00Z"))
+    #expect(point.isApproximate)
+    #expect(result.warnings.contains { $0.contains("短暂") && $0.contains("2026-08-20") })
+}
+
+@Test("Several low polls recover at the exact two-point and five-minute bounds without double counting")
+func dailyQuotaTransientDipBoundsAndRepeatedLowPolls() throws {
+    let report = try quotaReport(
+        samples: [quotaSample("2026-08-20T09:00:00Z", input: 2_000_000)],
+        observations: [
+            quotaSnapshot("2026-08-19T23:00:00Z", used: 17),
+            quotaSnapshot("2026-08-20T09:00:00Z", used: 20),
+            quotaSnapshot("2026-08-20T09:01:00Z", used: 18),
+            quotaSnapshot("2026-08-20T09:02:00Z", used: 19),
+            quotaSnapshot("2026-08-20T09:03:00Z", used: 18.5),
+            quotaSnapshot("2026-08-20T09:05:00Z", used: 20),
+            quotaSnapshot("2026-08-20T18:00:00Z", used: 49)
+        ]
+    )
+    let result = try quotaTrend([report], from: "2026-08-20T00:00:00Z", through: "2026-08-20T23:00:00Z")
+
+    #expect(result.points.count == 1)
+    #expect(result.points[0].cumulativeUsedPercent == 32)
+    #expect(result.points[0].usdPerPercent == Decimal(string: "0.0625"))
+    #expect(result.warnings.contains { $0.contains("短暂") && $0.contains("2026-08-20") })
+}
+
+@Test("A repeated high-water observation refreshes the transient recovery time boundary")
+func dailyQuotaTransientDipUsesLatestHighWaterObservation() throws {
+    let report = try quotaReport(observations: [
+        quotaSnapshot("2026-08-19T23:00:00Z", used: 17),
+        quotaSnapshot("2026-08-20T09:00:00Z", used: 20),
+        quotaSnapshot("2026-08-20T09:04:00Z", used: 20),
+        quotaSnapshot("2026-08-20T09:05:00Z", used: 18),
+        quotaSnapshot("2026-08-20T09:08:00Z", used: 21)
+    ])
+    let result = try quotaTrend([report], from: "2026-08-20T00:00:00Z", through: "2026-08-20T23:00:00Z")
+
+    #expect(result.points[0].cumulativeUsedPercent == 4)
+    #expect(result.points[0].usdPerPercent == nil)
+    #expect(result.warnings.contains { $0.contains("短暂") })
+}
+
+@Test("Fast recovery after the dip cannot excuse more than five minutes since the high-water observation")
+func dailyQuotaLateTransientRecoveryStaysBlank() throws {
+    let report = try quotaReport(
+        samples: [quotaSample("2026-08-20T09:00:00Z", input: 1_000_000)],
+        observations: [
+            quotaSnapshot("2026-08-19T23:00:00Z", used: 17),
+            quotaSnapshot("2026-08-20T09:00:00Z", used: 20),
+            quotaSnapshot("2026-08-20T09:04:50Z", used: 18),
+            quotaSnapshot("2026-08-20T09:05:01Z", used: 20),
+            quotaSnapshot("2026-08-20T18:00:00Z", used: 49)
+        ]
+    )
+    let result = try quotaTrend([report], from: "2026-08-20T00:00:00Z", through: "2026-08-20T23:00:00Z")
+
+    #expect(result.points[0].cumulativeUsedPercent == nil)
+    #expect(result.points[0].usdPerPercent == nil)
+    #expect(result.warnings.contains { $0.contains("下降") })
+}
+
+@Test("A deep decrease stays blank even when it quickly recovers in the same period")
+func dailyQuotaDeepRecoveredDropStaysBlank() throws {
+    for low in [77.99, 0] {
+        let report = try quotaReport(
+            samples: [quotaSample("2026-08-20T09:00:00Z", input: 1_000_000)],
+            observations: [
+                quotaSnapshot("2026-08-19T23:00:00Z", used: 70),
+                quotaSnapshot("2026-08-20T09:00:00Z", used: 80),
+                quotaSnapshot("2026-08-20T09:01:00Z", used: low),
+                quotaSnapshot("2026-08-20T09:02:00Z", used: 80)
+            ]
+        )
+        let result = try quotaTrend([report], from: "2026-08-20T00:00:00Z", through: "2026-08-20T23:00:00Z")
+
+        #expect(result.points[0].cumulativeUsedPercent == nil)
+        #expect(result.points[0].usdPerPercent == nil)
+        #expect(result.warnings.contains { $0.contains("下降") })
+    }
+}
+
+@Test("A previous-day baseline cannot establish a transient recovery within today's segment")
+func dailyQuotaRecoveredDropAcrossMidnightStaysBlank() throws {
+    let report = try quotaReport(
+        samples: [quotaSample("2026-08-20T00:00:00Z", input: 1_000_000)],
+        observations: [
+            quotaSnapshot("2026-08-19T23:59:00Z", used: 20),
+            quotaSnapshot("2026-08-20T00:00:10Z", used: 18),
+            quotaSnapshot("2026-08-20T00:00:40Z", used: 20),
+            quotaSnapshot("2026-08-20T18:00:00Z", used: 49)
+        ]
+    )
+    let result = try quotaTrend([report], from: "2026-08-20T00:00:00Z", through: "2026-08-20T23:00:00Z")
+
+    #expect(result.points[0].cumulativeUsedPercent == nil)
+    #expect(result.points[0].usdPerPercent == nil)
+    #expect(result.warnings.contains { $0.contains("下降") })
+}
+
+@Test("Recovering a transient dip does not manufacture a nonzero daily denominator")
+func dailyQuotaRecoveredDipWithZeroDailyUseHasNoPrice() throws {
+    let report = try quotaReport(
+        samples: [quotaSample("2026-08-20T09:00:00Z", input: 1_000_000)],
+        observations: [
+            quotaSnapshot("2026-08-19T23:00:00Z", used: 20),
+            quotaSnapshot("2026-08-20T09:00:00Z", used: 20),
+            quotaSnapshot("2026-08-20T09:01:00Z", used: 18),
+            quotaSnapshot("2026-08-20T09:02:00Z", used: 20)
+        ]
+    )
+    let result = try quotaTrend([report], from: "2026-08-20T00:00:00Z", through: "2026-08-20T23:00:00Z")
+
+    #expect(result.points[0].cumulativeUsedPercent == 0)
+    #expect(result.points[0].usdPerPercent == nil)
+}
+
+@Test("A final small unrecovered dip blanks the day even after an earlier successful recovery")
+func dailyQuotaFinalSmallDipStaysBlank() throws {
+    for recoveredEarlier in [false, true] {
+        var observations = [
+            quotaSnapshot("2026-08-19T23:00:00Z", used: 17),
+            quotaSnapshot("2026-08-20T09:00:00Z", used: 20),
+            quotaSnapshot("2026-08-20T09:01:00Z", used: 18)
+        ]
+        if recoveredEarlier {
+            observations.append(quotaSnapshot("2026-08-20T09:02:00Z", used: 20))
+        }
+        observations.append(quotaSnapshot("2026-08-20T09:03:00Z", used: 19))
+        let report = try quotaReport(
+            samples: [quotaSample("2026-08-20T09:00:00Z", input: 1_000_000)],
+            observations: observations
+        )
+        let result = try quotaTrend([report], from: "2026-08-20T00:00:00Z", through: "2026-08-20T23:00:00Z")
+
+        #expect(result.points[0].cumulativeUsedPercent == nil)
+        #expect(result.points[0].usdPerPercent == nil)
+        #expect(result.warnings.contains { $0.contains("下降") && $0.contains("2026-08-20") })
+        #expect(!result.warnings.contains { $0.contains("短暂") })
+    }
+}
+
 @Test("A new period first observed a day after reset is an approximate start, not today's reset")
 func dailyQuotaResetWasYesterday() throws {
     let report = try quotaReport(observations: [
